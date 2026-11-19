@@ -1,0 +1,12 @@
+import {
+  "mbui/host",
+  "mbui/ui",
+}
+
+options(
+  "is-main": true,
+  "native-stub": [ "hidpp_win.c" ],
+  link: {
+    "native": {},
+  },
+)
