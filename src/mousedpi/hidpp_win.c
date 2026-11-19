@@ -138,13 +138,21 @@ static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
 static void add_tray_icon(HWND hwnd) {
     if (g_tray_added) return;
+    HINSTANCE hInst = GetModuleHandleW(NULL);
+    HICON hSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    HICON hBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    if (!hSmall) hSmall = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
+    if (!hBig) hBig = hSmall;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hBig);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
+
     memset(&g_nid, 0, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
+    g_nid.hIcon = hSmall;
     swprintf(g_nid.szTip, 128, L"PRO X2 SUPERSTRIKE - %d DPI", g_dpi_x);
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
         g_tray_added = 1;
