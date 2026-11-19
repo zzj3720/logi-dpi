@@ -2,6 +2,9 @@
 extern "C" fn mousedpi_setup_window(w : Int, h : Int) -> Int = "mousedpi_setup_window"
 
 ///|
+extern "C" fn mousedpi_init_and_restore() -> Int = "mousedpi_init_and_restore"
+
+///|
 extern "C" fn mousedpi_read_state() -> Int = "mousedpi_read_state"
 
 ///|
@@ -17,7 +20,10 @@ extern "C" fn mousedpi_get_lod() -> Int = "mousedpi_get_lod"
 extern "C" fn mousedpi_get_battery() -> Int = "mousedpi_get_battery"
 
 ///|
-extern "C" fn mousedpi_get_mode() -> Int = "mousedpi_get_mode"
+extern "C" fn mousedpi_get_autostart() -> Int = "mousedpi_get_autostart"
+
+///|
+extern "C" fn mousedpi_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
 
 ///|
 struct AppState {
@@ -27,7 +33,7 @@ struct AppState {
   mut dpi : Int
   mut lod : Int
   mut battery : Int
-  mut mode : Int
+  mut autostart : Bool
   mut dragging : Bool
 }
 
@@ -39,7 +45,7 @@ let state : AppState = {
   dpi: 800,
   lod: 2,
   battery: -1,
-  mode: 0,
+  autostart: false,
   dragging: false,
 }
 
@@ -50,17 +56,29 @@ let slider_min : Double = 200.0
 let slider_max : Double = 4000.0
 
 ///|
-fn refresh_mouse() -> Unit {
-  let ok = mousedpi_read_state()
+fn sync_from_c(ok : Int) -> Unit {
   if ok != 0 {
     state.connected = true
     state.dpi = mousedpi_get_dpi_x()
     state.lod = mousedpi_get_lod()
     state.battery = mousedpi_get_battery()
-    state.mode = mousedpi_get_mode()
   } else {
     state.connected = false
   }
+}
+
+///|
+fn init_mouse() -> Unit {
+  let ok = mousedpi_init_and_restore()
+  sync_from_c(ok)
+  state.autostart = mousedpi_get_autostart() != 0
+}
+
+///|
+fn refresh_mouse() -> Unit {
+  let ok = mousedpi_read_state()
+  sync_from_c(ok)
+  state.autostart = mousedpi_get_autostart() != 0
 }
 
 ///|
@@ -77,7 +95,6 @@ fn apply_dpi(target_dpi : Int, target_lod : Int) -> Unit {
     state.connected = true
     state.dpi = mousedpi_get_dpi_x()
     state.lod = mousedpi_get_lod()
-    state.mode = mousedpi_get_mode()
   }
 }
 
@@ -190,7 +207,7 @@ fn lod_segment(c : @ui.Ctx, id : Int, label : String, active : Bool) -> Bool {
 fn view(c : @ui.Ctx) -> Unit {
   if !state.inited {
     state.inited = true
-    refresh_mouse()
+    init_mouse()
   }
   if !state.win_ready {
     if mousedpi_setup_window(780, 460) != 0 {
@@ -198,7 +215,6 @@ fn view(c : @ui.Ctx) -> Unit {
     }
   }
 
-  // Handle interactive slider drag/click
   let (px, py, down) = c.pointer()
   if !down {
     state.dragging = false
@@ -240,7 +256,6 @@ fn view(c : @ui.Ctx) -> Unit {
         align=@ui.ACenter,
         justify=@ui.JBetween,
         fn() {
-          // Left: status dot + title + HID++ pill
           let _ = c.box(dir=@ui.Row, gap=10.0, align=@ui.ACenter, fn() {
             let dot_c : Int64 = if state.connected { 0x22C55EFFL } else { 0xF85149FFL }
             let _ = c.box(
@@ -262,7 +277,7 @@ fn view(c : @ui.Ctx) -> Unit {
               border_color=0xFFFFFF16L,
               fn() {
                 let _ = c.text(
-                  if state.connected { "HID++ 2.0 直连" } else { "未连接" },
+                  if state.connected { "HID++ 2.0 直连 · 托盘守护" } else { "未连接" },
                   size=11.0,
                   weight=500,
                   color=0x8B949EFFL,
@@ -271,7 +286,6 @@ fn view(c : @ui.Ctx) -> Unit {
             )
           })
 
-          // Right: Battery pill + Refresh button
           let _ = c.box(dir=@ui.Row, gap=8.0, align=@ui.ACenter, fn() {
             if state.connected && state.battery >= 0 {
               let bat_c : Int64 = if state.battery <= 20 { 0xFF7B72FFL } else { 0x3FB950FFL }
@@ -320,12 +334,12 @@ fn view(c : @ui.Ctx) -> Unit {
         h=@ui.Fill(1.0),
         gap=18.0,
         fn() {
-          // Left Column: Mouse Product Card
+          // Left Column: Mouse Product Card + Autostart toggle
           let _ = c.box(
             dir=@ui.Column,
             w=@ui.Px(264.0),
             h=@ui.Fill(1.0),
-            pad=18.0,
+            pad=16.0,
             align=@ui.ACenter,
             justify=@ui.JBetween,
             bg=0x13161DFFL,
@@ -333,24 +347,52 @@ fn view(c : @ui.Ctx) -> Unit {
             border=1.0,
             border_color=0xFFFFFF18L,
             fn() {
-              let _ = c.box(h=@ui.Px(4.0), fn() {})
               let _ = c.image(
                 "mouse.png",
-                w=@ui.Px(156.0),
-                h=@ui.Px(234.0),
+                w=@ui.Px(148.0),
+                h=@ui.Px(222.0),
                 bg=0x13161DFFL,
                 fade=false,
               )
-              let _ = c.box(dir=@ui.Column, align=@ui.ACenter, gap=4.0, fn() {
-                let _ = c.text("LIGHTSPEED · 无线", size=12.0, weight=500, color=0x9DA7B3FFL)
-                let mode_str = if state.mode == 2 {
-                  "主机实时控制"
-                } else if state.mode == 1 {
-                  "板载内存模式"
+              let _ = c.box(dir=@ui.Column, w=@ui.Fill(1.0), align=@ui.ACenter, gap=8.0, fn() {
+                let _ = c.text("LIGHTSPEED · 自动保存", size=11.5, weight=500, color=0x8B949EFFL)
+                let as_hov = c.hovered(1002)
+                let as_bg : Int64 = if state.autostart {
+                  if as_hov { 0x1B3B28FFL } else { 0x142D1FFFL }
+                } else if as_hov {
+                  0x222733FFL
                 } else {
-                  "USB HID++ 2.0"
+                  0x1A1E27FFL
                 }
-                let _ = c.text(mode_str, size=11.0, color=0x636C76FFL)
+                let as_bd : Int64 = if state.autostart { 0x22C55E55L } else { 0xFFFFFF18L }
+                let as_dot : Int64 = if state.autostart { 0x22C55EFFL } else { 0x636C76FFL }
+                let as_fg : Int64 = if state.autostart { 0x86EFACFFL } else { 0x9DA7B3FFL }
+                let _ = c.box(
+                  id=1002,
+                  dir=@ui.Row,
+                  gap=7.0,
+                  padx=12.0,
+                  h=@ui.Px(30.0),
+                  radius=999.0,
+                  align=@ui.ACenter,
+                  justify=@ui.JCenter,
+                  bg=as_bg,
+                  border=1.0,
+                  border_color=as_bd,
+                  fn() {
+                    let _ = c.box(w=@ui.Px(6.0), h=@ui.Px(6.0), radius=999.0, bg=as_dot, fn() {})
+                    let _ = c.text(
+                      if state.autostart { "开机自启：已开启" } else { "开机自启：已关闭" },
+                      size=11.5,
+                      weight=500,
+                      color=as_fg,
+                    )
+                  },
+                )
+                if c.pressed(1002) {
+                  let next = if state.autostart { 0 } else { 1 }
+                  state.autostart = mousedpi_set_autostart(next) != 0
+                }
               })
             },
           )
@@ -374,7 +416,6 @@ fn view(c : @ui.Ctx) -> Unit {
                 border=1.0,
                 border_color=0xFFFFFF18L,
                 fn() {
-                  // Number + -50/+50 row
                   let _ = c.box(
                     dir=@ui.Row,
                     w=@ui.Fill(1.0),
@@ -404,7 +445,6 @@ fn view(c : @ui.Ctx) -> Unit {
                     },
                   )
 
-                  // Interactive Slider + Ticks
                   let target_pct = dpi_to_ratio(state.dpi) * 100.0
                   let anim_pct = if state.dragging {
                     target_pct
@@ -420,7 +460,6 @@ fn view(c : @ui.Ctx) -> Unit {
                   }
 
                   let _ = c.box(dir=@ui.Column, w=@ui.Fill(1.0), gap=6.0, fn() {
-                    // Track + glowing fill + white circular thumb
                     let _ = c.box(
                       id=4001,
                       w=@ui.Fill(1.0),
@@ -429,7 +468,6 @@ fn view(c : @ui.Ctx) -> Unit {
                       justify=@ui.JStart,
                       dir=@ui.Row,
                       fn() {
-                        // Background track bar
                         let _ = c.box(
                           w=@ui.Fill(1.0),
                           h=@ui.Px(6.0),
@@ -438,7 +476,6 @@ fn view(c : @ui.Ctx) -> Unit {
                           dir=@ui.Row,
                           align=@ui.ACenter,
                           fn() {
-                            // Glowing cyan-white active fill
                             let _ = c.box(
                               w=@ui.Pct(clamped_pct),
                               h=@ui.Px(6.0),
@@ -448,7 +485,6 @@ fn view(c : @ui.Ctx) -> Unit {
                               shadow_color=0x38BDF877L,
                               fn() {},
                             )
-                            // Circular white thumb centered at the end of fill
                             let _ = c.box(
                               w=@ui.Px(18.0),
                               h=@ui.Px(18.0),
@@ -464,7 +500,6 @@ fn view(c : @ui.Ctx) -> Unit {
                       },
                     )
 
-                    // Precision vertical tick marks
                     let _ = c.box(
                       dir=@ui.Row,
                       w=@ui.Fill(1.0),

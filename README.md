@@ -13,6 +13,7 @@ No Logitech G HUB. No "Loading resources…" infinite spinner. No background ser
 - **Interactive Ticked Slider & Presets**: Smoothly drag or click along the 200–4000 DPI scale (50 DPI steps), fine-tune with `-50 / +50`, or jump to `400 / 800 / 1200 / 1600 / 3200`.
 - **Lift-Off Distance (LOD)**: Switch between Low (`1`), Medium (`2`), and High (`3`) LOD directly on the sensor.
 - **Live Battery (`0x1004`)**: Reads Unified Battery percentage directly from the mouse.
+- **Auto-Save & Sleep/Wake Guard**: Saves your DPI & LOD to `config.ini`, minimizes to the Windows system tray on close, automatically restores your DPI if the mouse wakes from sleep or reconnects, and includes a one-click Windows autostart (`--tray`) toggle.
 - **Native GPU-Rendered UI**: Built with MoonBit `mbui` (Direct3D / Direct2D / DirectWrite) — ~4.3 MB single binary, instant cold start, native Windows 11 dark title bar.
 
 ## Quick Start (Windows x64)
