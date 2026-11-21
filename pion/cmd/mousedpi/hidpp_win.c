@@ -106,15 +106,6 @@ static void remove_tray_icon(void) {
 }
 
 static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_INPUT) {
-        ULONGLONG now = GetTickCount64();
-        ULONGLONG prev = g_last_mouse_tick;
-        g_last_mouse_tick = now;
-        if (prev != 0 && (now - prev) >= 5000 && g_has_saved) {
-            signal_wake_restore();
-        }
-        return CallWindowProcW(g_orig_wndproc, hwnd, msg, wp, lp);
-    }
     if (msg == WM_POWERBROADCAST) {
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
             if (g_has_saved) signal_wake_restore();
@@ -572,6 +563,41 @@ static DWORD WINAPI wake_watcher_thread(LPVOID unused) {
     return 0;
 }
 
+/* The mouse's raw input (the wake guard: moved again after 5 s still), on a message-only window of its own thread: a
+ * high-polling mouse sends thousands of WM_INPUT a second, which must never queue on the UI's thread. */
+static LRESULT CALLBACK raw_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG prev = g_last_mouse_tick;
+        g_last_mouse_tick = now;
+        if (prev != 0 && (now - prev) >= 5000 && g_has_saved) {
+            signal_wake_restore();
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static DWORD WINAPI raw_input_thread(LPVOID unused) {
+    (void)unused;
+    WNDCLASSW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = raw_wndproc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"MouseDPIRawInput";
+    RegisterClassW(&wc);
+    HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    if (!h) return 0;
+    RAWINPUTDEVICE rid;
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02; /* Generic Desktop Mouse */
+    rid.dwFlags = RIDEV_INPUTSINK;
+    rid.hwndTarget = h;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0) > 0) DispatchMessageW(&m);
+    return 0;
+}
+
 /* The window's view of the mouse is read here, off its thread (HID++ answers can take hundreds of ms, more while the
  * receiver is busy): every 30 s, or at once when asked (mousedpi_request_refresh). g_state_rev counts the reads done,
  * so the window takes the cached values (mousedpi_get_*) only when there is something new. */
@@ -623,6 +649,8 @@ static void start_watcher_once(void) {
     }
     HANDLE th3 = CreateThread(NULL, 0, refresher_thread, NULL, 0, NULL);
     if (th3) CloseHandle(th3);
+    HANDLE th4 = CreateThread(NULL, 0, raw_input_thread, NULL, 0, NULL);
+    if (th4) CloseHandle(th4);
 }
 
 struct FindWinCtx {
@@ -690,14 +718,6 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
     SetWindowPos(hwnd, NULL, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
 
     g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)tray_wndproc);
-    {
-        RAWINPUTDEVICE rid;
-        rid.usUsagePage = 0x01;
-        rid.usUsage = 0x02; /* Generic Desktop Mouse */
-        rid.dwFlags = RIDEV_INPUTSINK;
-        rid.hwndTarget = hwnd;
-        RegisterRawInputDevices(&rid, 1, sizeof(rid));
-    }
     add_tray_icon(hwnd);
     if (has_tray_arg()) {
         ShowWindow(hwnd, SW_HIDE);
