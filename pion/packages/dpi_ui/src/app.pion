@@ -47,17 +47,6 @@ let presets : Array[Int] = [400, 800, 1200, 1600, 3200]
 
 let pi : Double = 3.141592653589793
 
-fn snap(v : Double) -> Int {
-  let s = dpi_step.to_double()
-  let n = ((v / s) + 0.5).to_int() * dpi_step
-  if n < dpi_least {
-    dpi_least
-  } else if n > dpi_most {
-    dpi_most
-  } else {
-    n
-  }
-}
 
 fn ink_strong() -> Int64 {
   lg::colors().content
@@ -243,37 +232,17 @@ fn dpi_column(body : view::View, m : Mouse, d : Device) -> Unit {
         )
       })
     })
-    // Dragging the slider moves the very pointer whose DPI it sets: writing as it goes would change the pointer's speed
-    // under the hand mid-drag. So while it is held the slider only shows the value; it is written as the hand lets go
-    // (a key's step, with nothing held, at once).
-    // While held the slider follows the hand exactly (`raw`, not snapped: snapping what it reads back would pull every
-    // small move back to the same 50 and the thumb would not move); the read-out shows it snapped.
-    let holding = signals::signal(false)
-    let raw = signals::signal(0.0)
+    // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`change`), the
+    // mouse is written once the hand lets go (`committed`).
     let _ = lg::liquid_slider_node(
       col,
-      fn() { if holding.get() { raw.get() } else { m.dpi.get().to_double() } },
-      fn(v : Double) -> Unit {
-        raw.set(v)
-        let to = snap(v)
-        if signals::untracked(fn() { holding.get() }) {
-          m.dpi.set(to)
-        } else {
-          set_dpi(to)
-        }
-      },
+      fn() { m.dpi.get().to_double() },
+      fn(v : Double) -> Unit { m.dpi.set(v.to_int()) },
       fn() { "DPI" },
       least=dpi_least.to_double(),
       most=dpi_most.to_double(),
-      held=fn(h : Bool) -> Unit {
-        if h {
-          raw.set(m.dpi.get().to_double())
-        }
-        holding.set(h)
-        if !h {
-          (d.set_dpi)(m.dpi.get(), m.lod.get())
-        }
-      },
+      step=dpi_step.to_double(),
+      committed=fn(v : Double) -> Unit { (d.set_dpi)(v.to_int(), m.lod.get()) },
     )
     // The scale under the slider.
     let _ = col.box(fn(scale : view::View) -> Unit {
