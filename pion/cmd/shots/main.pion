@@ -22,13 +22,14 @@ fn shot(dir : String, picture : String, name : String, dark : Bool, connected : 
       m.lod.set(l)
     },
     set_autostart: fn(on : Bool) -> Unit { m.autostart.set(on) },
+    window_act: fn(_w : Int) -> Unit { () },
   }
   let path = "\{dir}/\{name}.png"
   let tree = fn(root) { dpi_ui::app(root, m, d, picture=picture) }
   let ok = if frame >= 0 {
-    film::picture(tree, path=path, w=780.0, h=480.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
+    film::picture(tree, path=path, w=780.0, h=500.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
   } else {
-    film::picture(tree, path=path, w=780.0, h=480.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
+    film::picture(tree, path=path, w=780.0, h=500.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
   }
   film::say("dpi_shots: \{path} \{ok}")
   ok

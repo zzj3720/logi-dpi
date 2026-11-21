@@ -688,24 +688,13 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
                    ? (light == 0) : TRUE;
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
 
-    UINT dpi = 96;
-    HMODULE u32 = GetModuleHandleA("user32.dll");
-    if (u32) {
-        typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
-        GetDpiForWindowFn fn = (GetDpiForWindowFn)GetProcAddress(u32, "GetDpiForWindow");
-        if (fn) {
-            UINT d = fn(hwnd);
-            if (d >= 96) dpi = d;
-        }
-    }
-    int cw = (int)((logical_w * (int)dpi + 48) / 96);
-    int ch = (int)((logical_h * (int)dpi + 48) / 96);
-    RECT rc = { 0, 0, cw, ch };
-    DWORD style = (DWORD)GetWindowLongA(hwnd, GWL_STYLE);
-    DWORD ex_style = (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE);
-    AdjustWindowRectEx(&rc, style, FALSE, ex_style);
-    int ww = rc.right - rc.left;
-    int wh = rc.bottom - rc.top;
+    /* the window's size is the host's (window_setup); here it is only centred on its screen */
+    (void)logical_w;
+    (void)logical_h;
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+    int ww = wr.right - wr.left;
+    int wh = wr.bottom - wr.top;
 
     HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi;

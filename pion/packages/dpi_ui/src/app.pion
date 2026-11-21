@@ -2,6 +2,7 @@
 // (invar's `lg`, DESIGN.md's laws: no glass inside glass, concentric corners, ≥ 4.5:1 words, closed-form motion).
 // What the window shows comes from `Mouse` (signals the device side writes); what it asks goes through `Device`.
 
+import "dmath"
 import "lg"
 import "paint"
 import "signals"
@@ -34,6 +35,8 @@ pub struct Device {
   pub set_dpi : (Int, Int) -> Unit
   /// Start with Windows (in the tray) or not.
   pub set_autostart : (Bool) -> Unit
+  /// The window's own buttons (the window has no title bar of the system's): 1 minimize, 3 close (to the tray).
+  pub window_act : (Int) -> Unit
 }
 
 /// The slider's range and step (the sensor takes 100–44000; the hand wants 200–4000 in 50s).
@@ -110,9 +113,28 @@ fn wallpaper(root : view::View) -> Unit {
   })
 }
 
-/// A circular refresh arrow, 24-grid scaled to `size`.
+/// A refresh arrow, 24-grid scaled to `size`: a 300° stroke round the middle, open at the upper right, ending at the top
+/// in a filled head pointing on round (clockwise) into the opening.
 fn icon_refresh(parent : view::View, size : Double, ink : () -> Int64) -> Unit {
   let k = size / 24.0
+  let cx = 12.0
+  let cy = 12.5
+  let r = 6.5
+  let start = -pi / 6.0
+  let sweep = 5.0 * pi / 3.0
+  let end = start + sweep
+  // the head's point, its two corners: along the way round from the end, and either side of it
+  let ex = cx + r * dmath::cos(end)
+  let ey = cy + r * dmath::sin(end)
+  let tx = -dmath::sin(end)
+  let ty = dmath::cos(end)
+  let nx = dmath::cos(end)
+  let ny = dmath::sin(end)
+  let head : Array[Double] = [
+    (ex + tx * 3.4) * k, (ey + ty * 3.4) * k,
+    (ex + nx * 3.0 - tx * 0.6) * k, (ey + ny * 3.0 - ty * 0.6) * k,
+    (ex - nx * 3.0 - tx * 0.6) * k, (ey - ny * 3.0 - ty * 0.6) * k,
+  ]
   let _ = parent.box(fn(b : view::View) -> Unit {
     let _ = b
       .width(view::Live::Is(Some(size)))
@@ -121,12 +143,36 @@ fn icon_refresh(parent : view::View, size : Double, ink : () -> Int64) -> Unit {
       .shapes(view::Live::By(fn() {
         let c = ink()
         let arc_pts : Array[Double] = []
-        for p in paint::arc(12.0 * k, 12.0 * k, 7.2 * k, from=0.15 * pi, sweep=1.55 * pi) {
+        for p in paint::arc(cx * k, cy * k, r * k, from=start, sweep=sweep - 0.12) {
           arc_pts.push(p.0)
           arc_pts.push(p.1)
         }
-        let head : Array[Double] = [12.2 * k, 6.6 * k, 16.5 * k, 6.2 * k, 16.0 * k, 2.1 * k]
-        [paint::shape_of([(arc_pts, false), (head, false)], stroke=c, width=1.8 * k)]
+        [
+          paint::shape_of([(arc_pts, false)], stroke=c, width=2.0 * k),
+          paint::shape_of([(head, true)], fill=c),
+        ]
+      }))
+  })
+}
+
+/// A minimize bar and a close cross, 24-grid scaled to `size`.
+fn icon_line(parent : view::View, size : Double, ink : () -> Int64, cross~ : Bool = false) -> Unit {
+  let k = size / 24.0
+  let _ = parent.box(fn(b : view::View) -> Unit {
+    let _ = b
+      .width(view::Live::Is(Some(size)))
+      .height(view::Live::Is(Some(size)))
+      .shrink(view::Live::Is(0.0))
+      .shapes(view::Live::By(fn() {
+        let c = ink()
+        if cross {
+          let a : Array[Double] = [7.0 * k, 7.0 * k, 17.0 * k, 17.0 * k]
+          let b2 : Array[Double] = [17.0 * k, 7.0 * k, 7.0 * k, 17.0 * k]
+          [paint::shape_of([(a, false), (b2, false)], stroke=c, width=2.0 * k)]
+        } else {
+          let a : Array[Double] = [6.5 * k, 12.0 * k, 17.5 * k, 12.0 * k]
+          [paint::shape_of([(a, false)], stroke=c, width=2.0 * k)]
+        }
       }))
   })
 }
@@ -134,7 +180,9 @@ fn icon_refresh(parent : view::View, size : Double, ink : () -> Int64) -> Unit {
 /// The top: the mouse's name and link on the wallpaper (content), a battery badge and a refresh orb (glass) at the end.
 fn top_bar(page : view::View, m : Mouse, d : Device) -> Unit {
   let _ = page.box(fn(bar : view::View) -> Unit {
+    // the window's title bar (it has none of the system's): a press on it, not on a control, moves the window
     let _ = bar
+      .moves_window(view::Live::Is(true))
       .row(view::Live::Is(true))
       .height(view::Live::Is(Some(56.0)))
       .lies_along(view::Live::Is(view::Lies::Between))
@@ -162,6 +210,21 @@ fn top_bar(page : view::View, m : Mouse, d : Device) -> Unit {
         fn(ic : view::View, ink : () -> Int64) -> Unit { icon_refresh(ic, 20.0, ink) },
         fn() { (d.refresh)() },
         size=lg::LiquidButtonSize::Regular,
+      )
+      let _ = t.box(fn(gap : view::View) -> Unit { let _ = gap.width(view::Live::Is(Some(6.0))) })
+      let _ = lg::liquid_icon_button_node(
+        t,
+        fn() { "最小化" },
+        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_line(ic, 18.0, ink) },
+        fn() { (d.window_act)(1) },
+        size=lg::LiquidButtonSize::Small,
+      )
+      let _ = lg::liquid_icon_button_node(
+        t,
+        fn() { "关闭到托盘" },
+        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_line(ic, 18.0, ink, cross=true) },
+        fn() { (d.window_act)(3) },
+        size=lg::LiquidButtonSize::Small,
       )
     })
   })
@@ -289,7 +352,7 @@ fn dpi_column(body : view::View, m : Mouse, d : Device) -> Unit {
 pub fn app(root : view::View, m : Mouse, d : Device, picture~ : String = "mouse.png") -> Unit {
   wallpaper(root)
   let _ = root.box(fn(page : view::View) -> Unit {
-    let _ = page.grow(view::Live::Is(1.0)).padding(view::Live::Is((20.0, 10.0, 28.0, 24.0))).gap(view::Live::Is(8.0))
+    let _ = page.grow(view::Live::Is(1.0)).padding(view::Live::Is((20.0, 14.0, 20.0, 24.0))).gap(view::Live::Is(8.0))
     top_bar(page, m, d)
     let _ = page.box(fn(body : view::View) -> Unit {
       let _ = body.row(view::Live::Is(true)).grow(view::Live::Is(1.0)).gap(view::Live::Is(28.0))

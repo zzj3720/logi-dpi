@@ -32,7 +32,7 @@ extern "C" fn c_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
 
 let win_w : Int = 780
 
-let win_h : Int = 480
+let win_h : Int = 500
 
 /// When the window last asked for a DPI/LOD (the clock of at_moment): what the C side read back before that write
 /// lands is older than what is shown, so it is not taken for a while.
@@ -82,8 +82,9 @@ fn settle_window(v : view::View, tries : Int) -> Unit {
 
 fn main() -> Unit {
   host::install()
-  // the window as the app opens it: 780 × 480 points, no smaller than 640 × 420
-  hostapi::window_setup(640.0, 420.0, win_w.to_double(), win_h.to_double(), false)
+  // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
+  // the system's: the Liquid Glass page is the whole window)
+  hostapi::window_setup(640.0, 440.0, win_w.to_double(), win_h.to_double(), true)
   let m = dpi_ui::Mouse::new()
   sync(m, c_init_and_restore())
   m.autostart.set(c_autostart() != 0)
@@ -97,6 +98,7 @@ fn main() -> Unit {
       c_request_set(x, lod)
     },
     set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
+    window_act: fn(what : Int) -> Unit { hostapi::window_act(what) },
   }
   ui::run(
     "PRO X2 SUPERSTRIKE",
