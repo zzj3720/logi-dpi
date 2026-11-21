@@ -3,7 +3,6 @@ name = "dpi_ui"
 version = "0.1.0"
 
 [dependencies]
-dmath = { path = "../../../deps/invar/packages/dmath" }
 lg = { path = "../../../deps/invar/packages/lg" }
 paint = { path = "../../../deps/invar/packages/paint" }
 signals = { path = "../../../deps/invar/packages/signals" }

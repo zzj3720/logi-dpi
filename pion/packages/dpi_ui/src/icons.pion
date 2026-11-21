@@ -1,0 +1,91 @@
+// still.fail's own icons (monoid design/icons, drawn for still.fail; flattened as libs/sf-ui/src/icon_data.mbt has
+// them): 24-grid line art in 1.75 strokes, one colour. Each is groups of `kind width count x y …` (kind 0 an open
+// stroke, 1 a closed one, 2 a filled shape).
+
+import "paint"
+import "view"
+
+let icon_refresh_data : String = "0 1.75 17 20 9 19.547 7.711 18.938 6.594 18.172 5.648 17.25 4.875 16.172 4.273 14.938 3.844 13.547 3.586 12 3.5 10.906 3.555 9.875 3.719 8.906 3.992 8 4.375 7.156 4.867 6.375 5.469 5.656 6.18 5 7 0 1.75 3 20 4 20 9 15 9 0 1.75 17 4 15 4.453 16.289 5.062 17.406 5.828 18.352 6.75 19.125 7.828 19.727 9.062 20.156 10.453 20.414 12 20.5 13.094 20.445 14.125 20.281 15.094 20.008 16 19.625 16.844 19.133 17.625 18.531 18.344 17.82 19 17 0 1.75 3 4 20 4 15 9 15"
+
+let icon_minus_data : String = "0 1.75 2 4.5 12 19.5 12"
+
+let icon_close_data : String = "0 1.75 2 6 6 18 18 0 1.75 2 18 6 6 18"
+
+fn icon_numbers(s : String) -> Array[Double] {
+  let out : Array[Double] = []
+  let mut acc = 0.0
+  let mut frac = 0.0
+  let mut div = 1.0
+  let mut in_num = false
+  let mut in_frac = false
+  let mut neg = false
+  let n = s.length()
+  let mut i = 0
+  while i <= n {
+    let c = if i < n { s.code_unit_at(i) } else { 32 }
+    if c == 45 {
+      neg = true
+      in_num = true
+    } else if c == 46 {
+      in_frac = true
+      in_num = true
+    } else if c >= 48 && c <= 57 {
+      in_num = true
+      let dg = (c - 48).to_double()
+      if in_frac {
+        div = div * 10.0
+        frac = frac + dg / div
+      } else {
+        acc = acc * 10.0 + dg
+      }
+    } else if in_num {
+      let v = acc + frac
+      out.push(if neg { -v } else { v })
+      acc = 0.0
+      frac = 0.0
+      div = 1.0
+      in_num = false
+      in_frac = false
+      neg = false
+    }
+    i += 1
+  }
+  out
+}
+
+/// An icon's shapes `size` across, in `ink`.
+fn icon_shapes(data : String, size : Double, ink : Int64) -> Array[paint::Shape] {
+  let k = size / 24.0
+  let v = icon_numbers(data)
+  let out : Array[paint::Shape] = []
+  let mut i = 0
+  while i + 2 < v.length() {
+    let kind = v[i].to_int()
+    let width = v[i + 1]
+    let count = v[i + 2].to_int()
+    let pts : Array[Double] = []
+    let mut j = 0
+    while j < count * 2 && i + 3 + j < v.length() {
+      pts.push(v[i + 3 + j] * k)
+      j += 1
+    }
+    if kind == 2 {
+      out.push(paint::shape_of([(pts, true)], fill=ink))
+    } else {
+      out.push(paint::shape_of([(pts, kind == 1)], stroke=ink, width=width * k))
+    }
+    i = i + 3 + count * 2
+  }
+  out
+}
+
+/// The icon `data` drawn in a box `size` across, in `ink` as it changes.
+fn icon_node(parent : view::View, data : String, size : Double, ink : () -> Int64) -> Unit {
+  let _ = parent.box(fn(b : view::View) -> Unit {
+    let _ = b
+      .width(view::Live::Is(Some(size)))
+      .height(view::Live::Is(Some(size)))
+      .shrink(view::Live::Is(0.0))
+      .shapes(view::Live::By(fn() { icon_shapes(data, size, ink()) }))
+  })
+}

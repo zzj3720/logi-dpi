@@ -2,9 +2,7 @@
 // (invar's `lg`, DESIGN.md's laws: no glass inside glass, concentric corners, ≥ 4.5:1 words, closed-form motion).
 // What the window shows comes from `Mouse` (signals the device side writes); what it asks goes through `Device`.
 
-import "dmath"
 import "lg"
-import "paint"
 import "signals"
 import "view"
 
@@ -47,8 +45,6 @@ pub let dpi_most : Int = 4000
 pub let dpi_step : Int = 50
 
 let presets : Array[Int] = [400, 800, 1200, 1600, 3200]
-
-let pi : Double = 3.141592653589793
 
 
 fn ink_strong() -> Int64 {
@@ -113,70 +109,6 @@ fn wallpaper(root : view::View) -> Unit {
   })
 }
 
-/// A refresh arrow, 24-grid scaled to `size`: a 300° stroke round the middle, open at the upper right, ending at the top
-/// in a filled head pointing on round (clockwise) into the opening.
-fn icon_refresh(parent : view::View, size : Double, ink : () -> Int64) -> Unit {
-  let k = size / 24.0
-  let cx = 12.0
-  let cy = 12.5
-  let r = 6.5
-  let start = -pi / 6.0
-  let sweep = 5.0 * pi / 3.0
-  let end = start + sweep
-  // the head's point, its two corners: along the way round from the end, and either side of it
-  let ex = cx + r * dmath::cos(end)
-  let ey = cy + r * dmath::sin(end)
-  let tx = -dmath::sin(end)
-  let ty = dmath::cos(end)
-  let nx = dmath::cos(end)
-  let ny = dmath::sin(end)
-  let head : Array[Double] = [
-    (ex + tx * 3.4) * k, (ey + ty * 3.4) * k,
-    (ex + nx * 3.0 - tx * 0.6) * k, (ey + ny * 3.0 - ty * 0.6) * k,
-    (ex - nx * 3.0 - tx * 0.6) * k, (ey - ny * 3.0 - ty * 0.6) * k,
-  ]
-  let _ = parent.box(fn(b : view::View) -> Unit {
-    let _ = b
-      .width(view::Live::Is(Some(size)))
-      .height(view::Live::Is(Some(size)))
-      .shrink(view::Live::Is(0.0))
-      .shapes(view::Live::By(fn() {
-        let c = ink()
-        let arc_pts : Array[Double] = []
-        for p in paint::arc(cx * k, cy * k, r * k, from=start, sweep=sweep - 0.12) {
-          arc_pts.push(p.0)
-          arc_pts.push(p.1)
-        }
-        [
-          paint::shape_of([(arc_pts, false)], stroke=c, width=2.0 * k),
-          paint::shape_of([(head, true)], fill=c),
-        ]
-      }))
-  })
-}
-
-/// A minimize bar and a close cross, 24-grid scaled to `size`.
-fn icon_line(parent : view::View, size : Double, ink : () -> Int64, cross~ : Bool = false) -> Unit {
-  let k = size / 24.0
-  let _ = parent.box(fn(b : view::View) -> Unit {
-    let _ = b
-      .width(view::Live::Is(Some(size)))
-      .height(view::Live::Is(Some(size)))
-      .shrink(view::Live::Is(0.0))
-      .shapes(view::Live::By(fn() {
-        let c = ink()
-        if cross {
-          let a : Array[Double] = [7.0 * k, 7.0 * k, 17.0 * k, 17.0 * k]
-          let b2 : Array[Double] = [17.0 * k, 7.0 * k, 7.0 * k, 17.0 * k]
-          [paint::shape_of([(a, false), (b2, false)], stroke=c, width=2.0 * k)]
-        } else {
-          let a : Array[Double] = [6.5 * k, 12.0 * k, 17.5 * k, 12.0 * k]
-          [paint::shape_of([(a, false)], stroke=c, width=2.0 * k)]
-        }
-      }))
-  })
-}
-
 /// The top: the mouse's name and link on the wallpaper (content), a battery badge and a refresh orb (glass) at the end.
 fn top_bar(page : view::View, m : Mouse, d : Device) -> Unit {
   let _ = page.box(fn(bar : view::View) -> Unit {
@@ -207,23 +139,27 @@ fn top_bar(page : view::View, m : Mouse, d : Device) -> Unit {
       let _ = lg::liquid_icon_button_node(
         t,
         fn() { "刷新" },
-        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_refresh(ic, 20.0, ink) },
+        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_refresh_data, 18.0, ink) },
         fn() { (d.refresh)() },
-        size=lg::LiquidButtonSize::Regular,
-      )
-      let _ = t.box(fn(gap : view::View) -> Unit { let _ = gap.width(view::Live::Is(Some(6.0))) })
-      let _ = lg::liquid_icon_button_node(
-        t,
-        fn() { "最小化" },
-        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_line(ic, 18.0, ink) },
-        fn() { (d.window_act)(1) },
         size=lg::LiquidButtonSize::Small,
       )
-      let _ = lg::liquid_icon_button_node(
+      // the window's own buttons, one small glass group
+      let _ = lg::liquid_button_group_node(
         t,
-        fn() { "关闭到托盘" },
-        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_line(ic, 18.0, ink, cross=true) },
-        fn() { (d.window_act)(3) },
+        fn() {
+          [
+            lg::LiquidGroupAction::new(
+              label=fn() { "最小化" },
+              icon=fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_minus_data, 16.0, ink) },
+              press=fn() { (d.window_act)(1) },
+            ),
+            lg::LiquidGroupAction::new(
+              label=fn() { "关闭到托盘" },
+              icon=fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_close_data, 16.0, ink) },
+              press=fn() { (d.window_act)(3) },
+            ),
+          ]
+        },
         size=lg::LiquidButtonSize::Small,
       )
     })
