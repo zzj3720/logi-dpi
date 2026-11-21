@@ -1,0 +1,62 @@
+diff --git a/packages/host/native/win_app.c b/packages/host/native/win_app.c
+index 11e7220..dfc04ff 100644
+--- a/packages/host/native/win_app.c
++++ b/packages/host/native/win_app.c
+@@ -25,6 +25,7 @@
+ #include "term.h"
+ #include "app_calls.h"  // the app's own calls
+ #include "done_watch.h"
++extern void mousedpi_mark(int32_t n);
+ 
+ #pragma comment(lib, "user32.lib")
+ #pragma comment(lib, "gdi32.lib")
+@@ -326,7 +327,9 @@ static void draw_frame(void) {
+   double begins = mb_now_ms();
+   frame_late = last_begin >= 0 && !script ? fmax(0, begins - last_begin - display_period()) : 0;
+   last_begin = begins;
++  { static int nf; if (nf < 3) mousedpi_mark(110 + nf++ * 2); }
+   mb_cb.frame(ws->frame_w, ws->frame_h, ws->scale, begins);
++  { static int nf2; if (nf2 < 3) mousedpi_mark(111 + nf2++ * 2); }
+   frame_counted();
+ }
+ 
+@@ -358,6 +361,7 @@ static void held_shown_now(void) {
+     window_to_show = 0;
+     window_shown = 1;
+     cloak(hwnd, FALSE);
++    mousedpi_mark(120);
+   }
+ }
+ 
+@@ -1256,6 +1260,7 @@ static void run_script_step(int step) {
+ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointer_fn,
+                  mb_wheel_fn wheel_fn, mb_key_fn key, mb_text_fn text) {
+   mb_cb = (mb_callbacks){frame, pointer_fn, wheel_fn, key, text};
++  mousedpi_mark(101);
+   script = getenv("MBUI_SCRIPT");
+   shot_dir = _wgetenv(L"MBUI_SHOT_DIR");
+   // (an app's console, its one run and its identity: decided as the program started, win_life.h life_begin)
+@@ -1292,6 +1297,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
+   win_making = 0;
+   hwnd = CreateWindowExW(0, cls, t, style, CW_USEDEFAULT, CW_USEDEFAULT, (int)ww, (int)wh, NULL, NULL,
+                          wc.hInstance, NULL);
++  mousedpi_mark(102);
+   win_making = -1;
+   win_slots[0].h = hwnd;
+   // that client area at the monitor's scale
+@@ -1304,11 +1310,15 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
+   ImmAssociateContextEx(hwnd, NULL, 0);  // no input method until an editor has focus
+   // (where it was last left, an app's: win_life.h place_put_back)
+   int show = place_put_back();
++  mousedpi_mark(103);
+   if (!mb_render_init(hwnd)) exit(1);
++  mousedpi_mark(104);
+   // (held: out of sight till the app shows it, mb_host_window_show; shown at once where DWM cannot cloak it)
+   if (window_held && !window_shown && !cloak(hwnd, TRUE)) window_shown = 1;
+   ShowWindow(hwnd, show);
++  mousedpi_mark(105);
+   life_start(t);
++  mousedpi_mark(106);
+   drop_start(0);
+   free(given);
+   ws->want_frame = 1;

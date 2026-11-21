@@ -18,6 +18,12 @@ extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
 
 extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
 
+extern "C" fn c_wait_rev(seen : Int) -> Int = "mousedpi_wait_rev"
+
+extern "C" fn c_stop_waits() -> Unit = "mousedpi_stop_waits"
+
+extern "C" fn c_peek_config(which : Int) -> Int = "mousedpi_peek_config"
+
 extern "C" fn c_connected() -> Int = "mousedpi_get_connected"
 
 extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
@@ -36,51 +42,38 @@ let win_w : Int = 780
 
 let win_h : Int = 500
 
-/// When the window last asked for a DPI/LOD (the clock of at_moment): what the C side read back before that write
-/// lands is older than what is shown, so it is not taken for a while.
+/// What a read of the mouse found, from the reader thread to the window's (`ok`: the receiver answered).
+struct Read {
+  ok : Int
+  dpi : Int
+  lod : Int
+  battery : Int
+}
+
+fn read_now(ok : Int) -> Read {
+  Read::{ ok, dpi: c_dpi_x(), lod: c_lod(), battery: c_battery() }
+}
+
+/// When the window last asked for a DPI/LOD (hostapi::now): what the C side read back before that write lands is
+/// older than what is shown, so it is not taken for a while.
 let last_asked : Array[Double] = [-100000.0]
 
-/// The window's root (for its clock), once it is made.
-let root_view : Array[Option[view::View]] = [None]
-
-fn root_clock() -> Double {
-  match root_view[0] {
-    Some(v) => v.cause_at()
-    None => 0.0
+/// A read into the window's signals.
+fn take(m : dpi_ui::Mouse, r : Read) -> Unit {
+  m.connected.set(r.ok != 0)
+  if r.ok != 0 {
+    if hostapi::now() - last_asked[0] > 1500.0 {
+      m.dpi.set(r.dpi)
+      m.lod.set(r.lod)
+    }
+    m.battery.set(r.battery)
   }
 }
 
-/// The C side's state into the window's signals (`ok`: the receiver answered).
-fn sync(m : dpi_ui::Mouse, ok : Int, now~ : Double = 0.0) -> Unit {
-  m.connected.set(ok != 0)
-  if ok != 0 {
-    if now - last_asked[0] > 1500.0 {
-      m.dpi.set(c_dpi_x())
-      m.lod.set(c_lod())
-    }
-    m.battery.set(c_battery())
-  }
-}
-
-/// Takes what the C side's refresher thread read (every 30 s or when asked: the battery, a receiver plugged in later, a
-/// DPI the wake guard put back), looking once a second; no HID++ I/O on the window's thread.
-fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
-  // (a second from now on the host's clock: the tree's starts at 0 before its first frame, and a chain set from that
-  // caught up one second at a time with the host's clock, which counts from boot: ~300 000 turns, 0.17 s of a start)
-  let now = if v.cause_at() > hostapi::now() { v.cause_at() } else { hostapi::now() }
-  let _ = v.at_moment(now + 1000.0, fn() {
-    let rev = c_state_rev()
-    if rev != seen {
-      sync(m, c_connected(), now=v.cause_at())
-    }
-    keep_watching(v, m, rev)
-  }, later=true)
-}
-
-fn main() -> Unit {
+fn main(world : World) -> Int {
   // one MouseDPI at a time: a second start brings the running one to the front and ends
   if c_single() == 0 {
-    return
+    return 0
   }
   host::install()
   // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
@@ -88,14 +81,18 @@ fn main() -> Unit {
   hostapi::window_setup(640.0, 440.0, win_w.to_double(), win_h.to_double(), true)
   // held out of sight till the C side has centred it (mousedpi_setup_soon shows it then)
   hostapi::window_hold()
+  // shown as config.ini last had it till the mouse answers (read on the reader thread, not this one; opening the
+  // receiver there can take ~350 ms while the GPU's driver loads beside it): taken as there, not "未连接" for a moment
   let m = dpi_ui::Mouse::new()
-  sync(m, c_init_and_restore())
+  m.connected.set(true)
+  m.dpi.set(c_peek_config(0))
+  m.lod.set(c_peek_config(1))
   m.autostart.set(c_autostart() != 0)
   let d = dpi_ui::Device::{
     refresh: fn() { c_request_refresh() },
-    // shown at once; written by the C side's thread (the newest asked), its read back taken as keep_watching sees it
+    // shown at once; written by the C side's thread (the newest asked), its read back taken as the reader brings it
     set_dpi: fn(x : Int, lod : Int) -> Unit {
-      last_asked[0] = root_clock()
+      last_asked[0] = hostapi::now()
       m.dpi.set(x)
       m.lod.set(lod)
       c_request_set(x, lod)
@@ -103,15 +100,34 @@ fn main() -> Unit {
     set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
     window_act: fn(what : Int) -> Unit { hostapi::window_act(what) },
   }
+  // the mouse read off this thread: the reader opens it (putting back the DPI config.ini keeps), then waits for each
+  // read the C side's refresher does (every 30 s, when asked, a DPI the wake guard put back) and hands it over, the
+  // window woken for it (ui::EventQueue: taken before the next frame, from inside the tree's maker: ui::run forgets
+  // hooks set before it)
+  let reads : ui::EventQueue[Read] = ui::EventQueue::new()
   // the window styled and given its tray icon by the C side as soon as it is up (raw input, power, close to tray)
   c_setup_soon()
-  ui::run(
-    "PRO X2 SUPERSTRIKE",
-    fn(root : view::View) -> Unit {
-      root_view[0] = Some(root)
-      dpi_ui::app(root, m, d, picture="mouse.png")
-      keep_watching(root, m, c_state_rev())
-    },
-    theme=lg::ui_theme,
-  )
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      let first = c_init_and_restore()
+      reads.emit(read_now(first))
+      let mut seen = c_state_rev()
+      while seen >= 0 {
+        seen = c_wait_rev(seen)
+        if seen >= 0 {
+          reads.emit(read_now(c_connected()))
+        }
+      }
+    })
+    ui::run(
+      "PRO X2 SUPERSTRIKE",
+      fn(root : view::View) -> Unit {
+        let _ = ui::on_before_frame(fn() { let _ = reads.drain(fn(r : Read) { take(m, r) }) })
+        dpi_ui::app(root, m, d, picture="mouse.png")
+      },
+      theme=lg::ui_theme,
+    )
+    c_stop_waits()
+  })
+  0
 }

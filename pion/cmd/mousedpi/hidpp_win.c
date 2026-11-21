@@ -57,9 +57,17 @@ static void signal_wake_restore(void) {
     if (g_wake_event) SetEvent(g_wake_event);
 }
 
+static HANDLE g_refresh_event = NULL;
+static CRITICAL_SECTION g_want_cs;
+
+/* First called on the window's thread (mousedpi_peek_config, before the mouse is read on a thread of its own): what
+ * the threads share is made here, once. */
 static void ensure_init(void) {
     if (!g_cs_inited) {
         InitializeCriticalSection(&g_hid_cs);
+        InitializeCriticalSection(&g_want_cs);
+        g_refresh_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_wake_event = CreateEventA(NULL, FALSE, FALSE, NULL);
         g_cs_inited = 1;
     }
     if (!g_cwd_set) {
@@ -115,6 +123,16 @@ static void remove_tray_icon(void) {
     }
 }
 
+static void show_held_window(void);
+
+/* The window brought up: shown (out of hiding; uncloaked if it was held from the start, --tray), restored, in front. */
+static void bring_up(HWND hwnd) {
+    show_held_window();
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
 static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_POWERBROADCAST) {
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
@@ -127,17 +145,13 @@ static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return 0;
     }
     if (msg == WM_SHOW_ME) {
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        bring_up(hwnd);
         return 0;
     }
     if (msg == WM_TRAYICON) {
         UINT ev = (UINT)(lp & 0xFFFF);
         if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) {
-            ShowWindow(hwnd, SW_SHOW);
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
+            bring_up(hwnd);
             return 0;
         }
         if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
@@ -152,9 +166,7 @@ static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
                 DestroyMenu(menu);
                 if (cmd == ID_TRAY_SHOW) {
-                    ShowWindow(hwnd, SW_SHOW);
-                    ShowWindow(hwnd, SW_RESTORE);
-                    SetForegroundWindow(hwnd);
+                    bring_up(hwnd);
                 } else if (cmd == ID_TRAY_QUIT) {
                     remove_tray_icon();
                     ExitProcess(0);
@@ -617,12 +629,21 @@ static DWORD WINAPI raw_input_thread(LPVOID unused) {
 /* The window's view of the mouse is read here, off its thread (HID++ answers can take hundreds of ms, more while the
  * receiver is busy): every 30 s, or at once when asked (mousedpi_request_refresh). g_state_rev counts the reads done,
  * so the window takes the cached values (mousedpi_get_*) only when there is something new. */
-static HANDLE g_refresh_event = NULL;
 static volatile LONG g_state_rev = 0;
+static SRWLOCK g_rev_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_rev_cv = CONDITION_VARIABLE_INIT;
+static int32_t g_rev_stop = 0;
+
+/* A read done: whoever waits for one (mousedpi_wait_rev) goes on. */
+static void bump_rev(void) {
+    AcquireSRWLockExclusive(&g_rev_lock);
+    InterlockedIncrement(&g_state_rev);
+    ReleaseSRWLockExclusive(&g_rev_lock);
+    WakeAllConditionVariable(&g_rev_cv);
+}
 
 /* Writes the window asks for (a slider dragged asks many), done here off its thread: only the newest one wanted is
  * written, the ones it replaced are dropped. */
-static CRITICAL_SECTION g_want_cs;
 static int32_t g_want_pending = 0, g_want_dpi = 0, g_want_lod = 0;
 
 static DWORD WINAPI refresher_thread(LPVOID unused) {
@@ -642,59 +663,28 @@ static DWORD WINAPI refresher_thread(LPVOID unused) {
             read_state_locked();
         }
         LeaveCriticalSection(&g_hid_cs);
-        InterlockedIncrement(&g_state_rev);
+        bump_rev();
         update_tray_tip();
     }
     return 0;
 }
 
 static void start_watcher_once(void) {
-    if (g_watcher_started) return;
-    g_watcher_started = 1;
-    if (!g_wake_event) {
-        g_wake_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-    }
+    if (InterlockedCompareExchange((volatile LONG *)&g_watcher_started, 1, 0) != 0) return;
     g_last_mouse_tick = GetTickCount64();
     HANDLE th1 = CreateThread(NULL, 0, wake_watcher_thread, NULL, 0, NULL);
     if (th1) CloseHandle(th1);
     HANDLE th2 = CreateThread(NULL, 0, hid_notify_thread, NULL, 0, NULL);
     if (th2) CloseHandle(th2);
-    if (!g_refresh_event) {
-        g_refresh_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-        InitializeCriticalSection(&g_want_cs);
-    }
     HANDLE th3 = CreateThread(NULL, 0, refresher_thread, NULL, 0, NULL);
     if (th3) CloseHandle(th3);
     HANDLE th4 = CreateThread(NULL, 0, raw_input_thread, NULL, 0, NULL);
     if (th4) CloseHandle(th4);
 }
 
-struct FindWinCtx {
-    DWORD pid;
-    HWND hwnd;
-};
-
-static BOOL CALLBACK enum_own_win(HWND hwnd, LPARAM lp) {
-    struct FindWinCtx *ctx = (struct FindWinCtx *)lp;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == ctx->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == NULL) {
-        ctx->hwnd = hwnd;
-        return FALSE;
-    }
-    return TRUE;
-}
-
-int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
+/* The host's window styled (title bar colours, centred, closed to the tray, its tray icon), on the window's thread. */
+static void style_window(HWND hwnd) {
     ensure_init();
-    if (g_win_styled) return 1;
-    struct FindWinCtx ctx;
-    ctx.pid = GetCurrentProcessId();
-    ctx.hwnd = NULL;
-    EnumWindows(enum_own_win, (LPARAM)&ctx);
-    if (!ctx.hwnd) return 0;
-
-    HWND hwnd = ctx.hwnd;
     g_main_hwnd = hwnd;
 
     /* The title bar follows Windows' light or dark apps setting, as the Liquid Glass window does. */
@@ -706,8 +696,6 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
 
     /* centred on its screen while it is still held out of sight (hostapi::window_hold: cloaked till the app shows it,
      * show_held_window), so it comes up in place rather than jumping there; its size stays the host's */
-    (void)logical_w;
-    (void)logical_h;
     RECT wr;
     GetWindowRect(hwnd, &wr);
     int ww = wr.right - wr.left;
@@ -723,12 +711,8 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
 
     g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)tray_wndproc);
     add_tray_icon(hwnd);
-    if (has_tray_arg()) {
-        ShowWindow(hwnd, SW_HIDE);
-    }
     start_watcher_once();
     g_win_styled = 1;
-    return 1;
 }
 
 
@@ -763,22 +747,38 @@ static void show_held_window(void) {
     PostThreadMessageW(g_ui_tid, WM_NULL, 0, 0); /* wakes the UI's loop to draw it */
 }
 
-static DWORD WINAPI setup_thread(LPVOID unused) {
-    (void)unused;
-    for (int i = 0; i < 6000; i++) {
-        if (mousedpi_setup_window(0, 0)) {
-            show_held_window();
-            return 0;
+/* The window styled as the host first shows it (ShowWindow, cloaked: hostapi::window_hold), on the window's thread,
+ * before its first frame: a hook of that thread's sent messages sees its WM_SHOWWINDOW. Then shown as that frame is
+ * on the screen, or, started --tray, kept held and hidden till it is brought up (bring_up). Looked for from another
+ * thread before (every 10 ms): its styling waited on the window's thread till its first frames were done, ~60 ms. */
+static HHOOK g_show_hook;
+static LRESULT CALLBACK show_hook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && !g_win_styled) {
+        const CWPSTRUCT *m = (const CWPSTRUCT *)lp;
+        if (m->message == WM_SHOWWINDOW && m->wParam && GetWindow(m->hwnd, GW_OWNER) == NULL &&
+            !(GetWindowLongPtrW(m->hwnd, GWL_STYLE) & WS_CHILD)) {
+            style_window(m->hwnd);
+            if (has_tray_arg()) PostMessageW(m->hwnd, WM_CLOSE, 0, 0); /* hidden to the tray (tray_wndproc) */
+            else show_held_window();
+            UnhookWindowsHookEx(g_show_hook);
+            g_show_hook = NULL;
         }
-        Sleep(10);
-        if (i == 300) show_held_window(); /* not found in 3 s: shown where it is */
     }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* (where no WM_SHOWWINDOW was seen in 3 s: shown where it is, unstyled, rather than held out of sight for good) */
+static DWORD WINAPI setup_fallback(LPVOID unused) {
+    (void)unused;
+    Sleep(3000);
+    if (!g_win_styled) show_held_window();
     return 0;
 }
 
 void mousedpi_setup_soon(void) {
     g_ui_tid = GetCurrentThreadId();
-    HANDLE th = CreateThread(NULL, 0, setup_thread, NULL, 0, NULL);
+    g_show_hook = SetWindowsHookExW(WH_CALLWNDPROC, show_hook, NULL, g_ui_tid);
+    HANDLE th = CreateThread(NULL, 0, setup_fallback, NULL, 0, NULL);
     if (th) CloseHandle(th);
 }
 
@@ -877,6 +877,31 @@ void mousedpi_request_set(int32_t dpi, int32_t lod) {
 }
 
 int32_t mousedpi_state_rev(void) { return (int32_t)g_state_rev; }
+
+/* Blocks till a read newer than `seen` is done (its rev), or -1 once mousedpi_stop_waits is called: the window's
+ * reader thread waits here, not the window. */
+int32_t mousedpi_wait_rev(int32_t seen) {
+    AcquireSRWLockExclusive(&g_rev_lock);
+    while ((int32_t)g_state_rev == seen && !g_rev_stop) SleepConditionVariableSRW(&g_rev_cv, &g_rev_lock, INFINITE, 0);
+    int32_t r = g_rev_stop ? -1 : (int32_t)g_state_rev;
+    ReleaseSRWLockExclusive(&g_rev_lock);
+    return r;
+}
+
+void mousedpi_stop_waits(void) {
+    AcquireSRWLockExclusive(&g_rev_lock);
+    g_rev_stop = 1;
+    ReleaseSRWLockExclusive(&g_rev_lock);
+    WakeAllConditionVariable(&g_rev_cv);
+}
+
+/* What config.ini says the mouse was last set to (0: dpi, 1: lod), read without the mouse: shown till it answers. */
+int32_t mousedpi_peek_config(int32_t which) {
+    ensure_init();
+    if (which == 0) return (int32_t)GetPrivateProfileIntA("mouse", "dpi", 800, g_cfg_path);
+    int32_t lod = (int32_t)GetPrivateProfileIntA("mouse", "lod", 2, g_cfg_path);
+    return (lod < 1 || lod > 3) ? 2 : lod;
+}
 int32_t mousedpi_get_connected(void) { return g_connected; }
 int32_t mousedpi_get_dpi_x(void) { return g_dpi_x; }
 int32_t mousedpi_get_lod(void) { return g_lod; }

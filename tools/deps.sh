@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fetches the pinned invar (pure-Pion UI framework + Liquid Glass `lg`) into deps/invar.
 set -e
-REV=6bc164727c016b5c3c47375d8264ec773cf4589f
+REV=6f10eb52e5844422e7f86bdd80ee054b9fc476d7
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/deps/invar"
 REPO="${INVAR_REPO:-https://github.com/AFK-surf/invar.git}"
 if [ -d "$DIR/.git" ]; then
