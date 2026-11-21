@@ -571,5 +571,5 @@ fn view(c : @ui.Ctx) -> Unit {
 
 ///|
 fn main {
-  @ui.run("PRO X2 SUPERSTRIKE", view)
+  @ui.run_legacy_ctx("PRO X2 SUPERSTRIKE", view)
 }
