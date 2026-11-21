@@ -246,13 +246,17 @@ fn dpi_column(body : view::View, m : Mouse, d : Device) -> Unit {
     // Dragging the slider moves the very pointer whose DPI it sets: writing as it goes would change the pointer's speed
     // under the hand mid-drag. So while it is held the slider only shows the value; it is written as the hand lets go
     // (a key's step, with nothing held, at once).
-    let holding : Array[Bool] = [false]
+    // While held the slider follows the hand exactly (`raw`, not snapped: snapping what it reads back would pull every
+    // small move back to the same 50 and the thumb would not move); the read-out shows it snapped.
+    let holding = signals::signal(false)
+    let raw = signals::signal(0.0)
     let _ = lg::liquid_slider_node(
       col,
-      fn() { m.dpi.get().to_double() },
+      fn() { if holding.get() { raw.get() } else { m.dpi.get().to_double() } },
       fn(v : Double) -> Unit {
+        raw.set(v)
         let to = snap(v)
-        if holding[0] {
+        if signals::untracked(fn() { holding.get() }) {
           m.dpi.set(to)
         } else {
           set_dpi(to)
@@ -262,7 +266,10 @@ fn dpi_column(body : view::View, m : Mouse, d : Device) -> Unit {
       least=dpi_least.to_double(),
       most=dpi_most.to_double(),
       held=fn(h : Bool) -> Unit {
-        holding[0] = h
+        if h {
+          raw.set(m.dpi.get().to_double())
+        }
+        holding.set(h)
         if !h {
           (d.set_dpi)(m.dpi.get(), m.lod.get())
         }
