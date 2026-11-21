@@ -19,6 +19,7 @@
 #define WM_TRAYICON (WM_APP + 42)
 #define ID_TRAY_SHOW 1001
 #define ID_TRAY_QUIT 1002
+#define WM_SHOW_ME (WM_APP + 43) /* another start of the program: come to the front */
 
 static CRITICAL_SECTION g_hid_cs;
 static int32_t g_cs_inited = 0;
@@ -123,6 +124,12 @@ static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     if (msg == WM_CLOSE) {
         ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    if (msg == WM_SHOW_ME) {
+        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
         return 0;
     }
     if (msg == WM_TRAYICON) {
@@ -727,7 +734,24 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
 
 
 /* The host's window, styled and given its tray icon as soon as it is up: looked for here off the UI's thread (every
- * 50 ms, for up to a minute), not by the window's own frames, which do not run before it shows. */
+ * 10 ms, for up to a minute), not by the window's own frames, which do not run before it shows. */
+/* One MouseDPI per person: a second start hands over to the one running (brings its window to the front, unless it
+ * was started for the tray) and ends, before any window of its own. 1: this is the one that runs. */
+int32_t mousedpi_single(void) {
+    HANDLE m = CreateMutexW(NULL, TRUE, L"Local\\MouseDPI.single");
+    if (m && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!has_tray_arg()) {
+            HWND other = FindWindowW(L"mbui", L"PRO X2 SUPERSTRIKE");
+            if (other) {
+                AllowSetForegroundWindow(ASFW_ANY);
+                PostMessageW(other, WM_SHOW_ME, 0, 0);
+            }
+        }
+        return 0;
+    }
+    return 1;
+}
+
 /* the host's: the window held out of sight as it opened (hostapi::window_hold) shown, and a frame asked for */
 extern void mb_host_window_show(void);
 extern void mb_host_request_frame(void);
@@ -741,13 +765,13 @@ static void show_held_window(void) {
 
 static DWORD WINAPI setup_thread(LPVOID unused) {
     (void)unused;
-    for (int i = 0; i < 1200; i++) {
+    for (int i = 0; i < 6000; i++) {
         if (mousedpi_setup_window(0, 0)) {
             show_held_window();
             return 0;
         }
-        Sleep(50);
-        if (i == 60) show_held_window(); /* not found in 3 s: shown where it is */
+        Sleep(10);
+        if (i == 300) show_held_window(); /* not found in 3 s: shown where it is */
     }
     return 0;
 }

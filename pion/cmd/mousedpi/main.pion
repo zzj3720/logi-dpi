@@ -10,6 +10,8 @@ import "view"
 
 extern "C" fn c_setup_soon() -> Unit = "mousedpi_setup_soon"
 
+extern "C" fn c_single() -> Int = "mousedpi_single"
+
 extern "C" fn c_init_and_restore() -> Int = "mousedpi_init_and_restore"
 
 extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
@@ -63,7 +65,10 @@ fn sync(m : dpi_ui::Mouse, ok : Int, now~ : Double = 0.0) -> Unit {
 /// Takes what the C side's refresher thread read (every 30 s or when asked: the battery, a receiver plugged in later, a
 /// DPI the wake guard put back), looking once a second; no HID++ I/O on the window's thread.
 fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
-  let _ = v.at_moment(v.cause_at() + 1000.0, fn() {
+  // (a second from now on the host's clock: the tree's starts at 0 before its first frame, and a chain set from that
+  // caught up one second at a time with the host's clock, which counts from boot: ~300 000 turns, 0.17 s of a start)
+  let now = if v.cause_at() > hostapi::now() { v.cause_at() } else { hostapi::now() }
+  let _ = v.at_moment(now + 1000.0, fn() {
     let rev = c_state_rev()
     if rev != seen {
       sync(m, c_connected(), now=v.cause_at())
@@ -73,6 +78,10 @@ fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
 }
 
 fn main() -> Unit {
+  // one MouseDPI at a time: a second start brings the running one to the front and ends
+  if c_single() == 0 {
+    return
+  }
   host::install()
   // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
   // the system's: the Liquid Glass page is the whole window)
