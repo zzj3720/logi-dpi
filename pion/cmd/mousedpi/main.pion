@@ -8,7 +8,7 @@ import "lg"
 import "ui"
 import "view"
 
-extern "C" fn c_setup_window(w : Int, h : Int) -> Int = "mousedpi_setup_window"
+extern "C" fn c_setup_soon() -> Unit = "mousedpi_setup_soon"
 
 extern "C" fn c_init_and_restore() -> Int = "mousedpi_init_and_restore"
 
@@ -72,14 +72,6 @@ fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
   }, later=true)
 }
 
-/// Styles and sizes the window once the host has opened it (tray, dark title bar, raw input for the wake guard).
-fn settle_window(v : view::View, tries : Int) -> Unit {
-  if c_setup_window(win_w, win_h) != 0 || tries > 200 {
-    return
-  }
-  let _ = v.at_moment(v.cause_at() + 50.0, fn() { settle_window(v, tries + 1) }, later=true)
-}
-
 fn main() -> Unit {
   host::install()
   // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
@@ -100,12 +92,13 @@ fn main() -> Unit {
     set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
     window_act: fn(what : Int) -> Unit { hostapi::window_act(what) },
   }
+  // the window styled and given its tray icon by the C side as soon as it is up (raw input, power, close to tray)
+  c_setup_soon()
   ui::run(
     "PRO X2 SUPERSTRIKE",
     fn(root : view::View) -> Unit {
       root_view[0] = Some(root)
       dpi_ui::app(root, m, d, picture="mouse.png")
-      settle_window(root, 0)
       keep_watching(root, m, c_state_rev())
     },
     theme=lg::ui_theme,

@@ -1,1 +1,2 @@
 1 ICON "app.ico"
+MBUI_ENV RCDATA "mbui_env.txt"

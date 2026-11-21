@@ -75,6 +75,15 @@ static void ensure_init(void) {
                 snprintf(g_cfg_path, MAX_PATH, "%s\\config.ini", dir);
             }
         }
+        /* the folder whose shaders/ keeps the host's compiled shaders (MBUI_SHADERS in the program's MBUI_ENV
+         * resource): its parent is ours to make */
+        char local[MAX_PATH];
+        DWORD ln = GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH);
+        if (ln > 0 && ln < MAX_PATH - 16) {
+            char app[MAX_PATH];
+            snprintf(app, MAX_PATH, "%s\\MouseDPI", local);
+            CreateDirectoryA(app, NULL);
+        }
     }
 }
 
@@ -714,6 +723,22 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
     start_watcher_once();
     g_win_styled = 1;
     return 1;
+}
+
+/* The host's window, styled and given its tray icon as soon as it is up: looked for here off the UI's thread (every
+ * 50 ms, for up to a minute), not by the window's own frames, which do not run before it shows. */
+static DWORD WINAPI setup_thread(LPVOID unused) {
+    (void)unused;
+    for (int i = 0; i < 1200; i++) {
+        if (mousedpi_setup_window(0, 0)) return 0;
+        Sleep(50);
+    }
+    return 0;
+}
+
+void mousedpi_setup_soon(void) {
+    HANDLE th = CreateThread(NULL, 0, setup_thread, NULL, 0, NULL);
+    if (th) CloseHandle(th);
 }
 
 int32_t mousedpi_init_and_restore(void) {
