@@ -18,7 +18,7 @@ extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
 
 extern "C" fn c_connected() -> Int = "mousedpi_get_connected"
 
-extern "C" fn c_set_dpi(x : Int, y : Int, lod : Int) -> Int = "mousedpi_set_dpi"
+extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
 
 extern "C" fn c_dpi_x() -> Int = "mousedpi_get_dpi_x"
 
@@ -34,12 +34,28 @@ let win_w : Int = 780
 
 let win_h : Int = 480
 
+/// When the window last asked for a DPI/LOD (the clock of at_moment): what the C side read back before that write
+/// lands is older than what is shown, so it is not taken for a while.
+let last_asked : Array[Double] = [-100000.0]
+
+/// The window's root (for its clock), once it is made.
+let root_view : Array[Option[view::View]] = [None]
+
+fn root_clock() -> Double {
+  match root_view[0] {
+    Some(v) => v.cause_at()
+    None => 0.0
+  }
+}
+
 /// The C side's state into the window's signals (`ok`: the receiver answered).
-fn sync(m : dpi_ui::Mouse, ok : Int) -> Unit {
+fn sync(m : dpi_ui::Mouse, ok : Int, now~ : Double = 0.0) -> Unit {
   m.connected.set(ok != 0)
   if ok != 0 {
-    m.dpi.set(c_dpi_x())
-    m.lod.set(c_lod())
+    if now - last_asked[0] > 1500.0 {
+      m.dpi.set(c_dpi_x())
+      m.lod.set(c_lod())
+    }
     m.battery.set(c_battery())
   }
 }
@@ -50,7 +66,7 @@ fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
   let _ = v.at_moment(v.cause_at() + 1000.0, fn() {
     let rev = c_state_rev()
     if rev != seen {
-      sync(m, c_connected())
+      sync(m, c_connected(), now=v.cause_at())
     }
     keep_watching(v, m, rev)
   }, later=true)
@@ -73,20 +89,19 @@ fn main() -> Unit {
   m.autostart.set(c_autostart() != 0)
   let d = dpi_ui::Device::{
     refresh: fn() { c_request_refresh() },
+    // shown at once; written by the C side's thread (the newest asked), its read back taken as keep_watching sees it
     set_dpi: fn(x : Int, lod : Int) -> Unit {
-      if c_set_dpi(x, x, lod) == 0 {
-        m.connected.set(true)
-        m.dpi.set(c_dpi_x())
-        m.lod.set(c_lod())
-      } else {
-        c_request_refresh()
-      }
+      last_asked[0] = root_clock()
+      m.dpi.set(x)
+      m.lod.set(lod)
+      c_request_set(x, lod)
     },
     set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
   }
   ui::run(
     "PRO X2 SUPERSTRIKE",
     fn(root : view::View) -> Unit {
+      root_view[0] = Some(root)
       dpi_ui::app(root, m, d, picture="mouse.png")
       settle_window(root, 0)
       keep_watching(root, m, c_state_rev())

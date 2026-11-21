@@ -578,12 +578,27 @@ static DWORD WINAPI wake_watcher_thread(LPVOID unused) {
 static HANDLE g_refresh_event = NULL;
 static volatile LONG g_state_rev = 0;
 
+/* Writes the window asks for (a slider dragged asks many), done here off its thread: only the newest one wanted is
+ * written, the ones it replaced are dropped. */
+static CRITICAL_SECTION g_want_cs;
+static int32_t g_want_pending = 0, g_want_dpi = 0, g_want_lod = 0;
+
 static DWORD WINAPI refresher_thread(LPVOID unused) {
     (void)unused;
     for (;;) {
-        WaitForSingleObject(g_refresh_event, 30000);
+        DWORD w = WaitForSingleObject(g_refresh_event, 30000);
+        EnterCriticalSection(&g_want_cs);
+        int32_t pending = g_want_pending, dpi = g_want_dpi, lod = g_want_lod;
+        g_want_pending = 0;
+        LeaveCriticalSection(&g_want_cs);
         EnterCriticalSection(&g_hid_cs);
-        read_state_locked();
+        if (pending) {
+            if (set_dpi_locked(dpi, dpi, lod) == 0) save_config(g_dpi_x, g_lod);
+            else read_state_locked();
+        } else {
+            (void)w;
+            read_state_locked();
+        }
         LeaveCriticalSection(&g_hid_cs);
         InterlockedIncrement(&g_state_rev);
         update_tray_tip();
@@ -604,6 +619,7 @@ static void start_watcher_once(void) {
     if (th2) CloseHandle(th2);
     if (!g_refresh_event) {
         g_refresh_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        InitializeCriticalSection(&g_want_cs);
     }
     HANDLE th3 = CreateThread(NULL, 0, refresher_thread, NULL, 0, NULL);
     if (th3) CloseHandle(th3);
@@ -771,6 +787,18 @@ void mousedpi_request_refresh(void) {
     ensure_init();
     start_watcher_once();
     if (g_refresh_event) SetEvent(g_refresh_event);
+}
+
+/* Ask for DPI (both axes) and LOD to be written (returns at once; the refresher thread writes the newest asked). */
+void mousedpi_request_set(int32_t dpi, int32_t lod) {
+    ensure_init();
+    start_watcher_once();
+    EnterCriticalSection(&g_want_cs);
+    g_want_pending = 1;
+    g_want_dpi = dpi;
+    g_want_lod = lod;
+    LeaveCriticalSection(&g_want_cs);
+    SetEvent(g_refresh_event);
 }
 
 int32_t mousedpi_state_rev(void) { return (int32_t)g_state_rev; }
