@@ -6,3 +6,4 @@ out/
 *.exp
 *.pdb
 *.zip
+deps/

@@ -1,0 +1,20 @@
+[package]
+name = "mousedpi"
+version = "0.3.0"
+
+[dependencies]
+dpi_ui = { path = "../../packages/dpi_ui" }
+host = { path = "../../../deps/invar/packages/host" }
+hostapi = { path = "../../../deps/invar/packages/hostapi" }
+lg = { path = "../../../deps/invar/packages/lg" }
+signals = { path = "../../../deps/invar/packages/signals" }
+ui = { path = "../../../deps/invar/packages/ui" }
+view = { path = "../../../deps/invar/packages/view" }
+
+[link.windows]
+c_sources = ["hidpp_win.c"]
+cc_flags = ["-O2"]
+libs = ["hid", "setupapi", "dwmapi", "user32", "shell32", "advapi32"]
+# the window/tray/taskbar icon (tools/build-win.sh makes it with windres) and a GUI app (no console)
+objects = ["../../../out/app.res"]
+flags = ["-mwindows"]

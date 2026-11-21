@@ -1,0 +1,46 @@
+// MouseDPI's window drawn offscreen with a stand-in mouse (invar's Apple Metal renderer, `film::picture`):
+//   DPI_SHOTS=<dir> DPI_PICTURE=<abs path of assets/mouse.png> dpi_shots
+
+import "dpi_ui"
+import "film"
+import "host"
+import "lg"
+import "ui"
+
+fn shot(dir : String, picture : String, name : String, dark : Bool, connected : Bool, dpi : Int, lod : Int, script~ : String = "", frame~ : Int = -1) -> Bool {
+  lg::set_dark(Some(dark))
+  let m = dpi_ui::Mouse::new()
+  m.connected.set(connected)
+  m.dpi.set(dpi)
+  m.lod.set(lod)
+  m.battery.set(if connected { 76 } else { -1 })
+  m.autostart.set(true)
+  let d = dpi_ui::Device::{
+    refresh: fn() { () },
+    set_dpi: fn(x : Int, l : Int) -> Unit {
+      m.dpi.set(x)
+      m.lod.set(l)
+    },
+    set_autostart: fn(on : Bool) -> Unit { m.autostart.set(on) },
+  }
+  let path = "\{dir}/\{name}.png"
+  let tree = fn(root) { dpi_ui::app(root, m, d, picture=picture) }
+  let ok = if frame >= 0 {
+    film::picture(tree, path=path, w=780.0, h=480.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
+  } else {
+    film::picture(tree, path=path, w=780.0, h=480.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
+  }
+  film::say("dpi_shots: \{path} \{ok}")
+  ok
+}
+
+fn main() -> Unit {
+  host::install()
+  let dir = ui::env("DPI_SHOTS")
+  let picture = ui::env("DPI_PICTURE")
+  let _ = shot(dir, picture, "dark", true, true, 1500, 2)
+  let _ = shot(dir, picture, "light", false, true, 1600, 1)
+  let _ = shot(dir, picture, "dark-offline", true, false, 800, 2)
+  // A finger holding the slider's thumb and dragging it right: the thumb turns to a glass lens.
+  let _ = shot(dir, picture, "dark-drag", true, true, 1500, 2, script="wait 300\nholdon 500 90 0 500 @439,203\nwait 300", frame=50)
+}

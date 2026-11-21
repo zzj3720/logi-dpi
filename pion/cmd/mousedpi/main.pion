@@ -1,0 +1,96 @@
+// MouseDPI for Windows: the Liquid Glass window (dpi_ui) over the HID++ 2.0 side (hidpp_win.c: the receiver, DPI/LOD,
+// battery, config.ini, tray, autostart, restoring the DPI as the mouse wakes).
+
+import "dpi_ui"
+import "host"
+import "hostapi"
+import "lg"
+import "ui"
+import "view"
+
+extern "C" fn c_setup_window(w : Int, h : Int) -> Int = "mousedpi_setup_window"
+
+extern "C" fn c_init_and_restore() -> Int = "mousedpi_init_and_restore"
+
+extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
+
+extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
+
+extern "C" fn c_connected() -> Int = "mousedpi_get_connected"
+
+extern "C" fn c_set_dpi(x : Int, y : Int, lod : Int) -> Int = "mousedpi_set_dpi"
+
+extern "C" fn c_dpi_x() -> Int = "mousedpi_get_dpi_x"
+
+extern "C" fn c_lod() -> Int = "mousedpi_get_lod"
+
+extern "C" fn c_battery() -> Int = "mousedpi_get_battery"
+
+extern "C" fn c_autostart() -> Int = "mousedpi_get_autostart"
+
+extern "C" fn c_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
+
+let win_w : Int = 780
+
+let win_h : Int = 480
+
+/// The C side's state into the window's signals (`ok`: the receiver answered).
+fn sync(m : dpi_ui::Mouse, ok : Int) -> Unit {
+  m.connected.set(ok != 0)
+  if ok != 0 {
+    m.dpi.set(c_dpi_x())
+    m.lod.set(c_lod())
+    m.battery.set(c_battery())
+  }
+}
+
+/// Takes what the C side's refresher thread read (every 30 s or when asked: the battery, a receiver plugged in later, a
+/// DPI the wake guard put back), looking once a second; no HID++ I/O on the window's thread.
+fn keep_watching(v : view::View, m : dpi_ui::Mouse, seen : Int) -> Unit {
+  let _ = v.at_moment(v.cause_at() + 1000.0, fn() {
+    let rev = c_state_rev()
+    if rev != seen {
+      sync(m, c_connected())
+    }
+    keep_watching(v, m, rev)
+  }, later=true)
+}
+
+/// Styles and sizes the window once the host has opened it (tray, dark title bar, raw input for the wake guard).
+fn settle_window(v : view::View, tries : Int) -> Unit {
+  if c_setup_window(win_w, win_h) != 0 || tries > 200 {
+    return
+  }
+  let _ = v.at_moment(v.cause_at() + 50.0, fn() { settle_window(v, tries + 1) }, later=true)
+}
+
+fn main() -> Unit {
+  host::install()
+  // the window as the app opens it: 780 × 480 points, no smaller than 640 × 420
+  hostapi::window_setup(640.0, 420.0, win_w.to_double(), win_h.to_double(), false)
+  let m = dpi_ui::Mouse::new()
+  sync(m, c_init_and_restore())
+  m.autostart.set(c_autostart() != 0)
+  let d = dpi_ui::Device::{
+    refresh: fn() { c_request_refresh() },
+    set_dpi: fn(x : Int, lod : Int) -> Unit {
+      if c_set_dpi(x, x, lod) == 0 {
+        m.connected.set(true)
+        m.dpi.set(c_dpi_x())
+        m.lod.set(c_lod())
+      } else {
+        c_request_refresh()
+      }
+    },
+    set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
+  }
+  ui::run(
+    "PRO X2 SUPERSTRIKE",
+    fn(root : view::View) -> Unit {
+      dpi_ui::app(root, m, d, picture="mouse.png")
+      settle_window(root, 0)
+      keep_watching(root, m, c_state_rev())
+    },
+    theme=lg::ui_theme,
+  )
+}

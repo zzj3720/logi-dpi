@@ -572,6 +572,25 @@ static DWORD WINAPI wake_watcher_thread(LPVOID unused) {
     return 0;
 }
 
+/* The window's view of the mouse is read here, off its thread (HID++ answers can take hundreds of ms, more while the
+ * receiver is busy): every 30 s, or at once when asked (mousedpi_request_refresh). g_state_rev counts the reads done,
+ * so the window takes the cached values (mousedpi_get_*) only when there is something new. */
+static HANDLE g_refresh_event = NULL;
+static volatile LONG g_state_rev = 0;
+
+static DWORD WINAPI refresher_thread(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(g_refresh_event, 30000);
+        EnterCriticalSection(&g_hid_cs);
+        read_state_locked();
+        LeaveCriticalSection(&g_hid_cs);
+        InterlockedIncrement(&g_state_rev);
+        update_tray_tip();
+    }
+    return 0;
+}
+
 static void start_watcher_once(void) {
     if (g_watcher_started) return;
     g_watcher_started = 1;
@@ -583,6 +602,11 @@ static void start_watcher_once(void) {
     if (th1) CloseHandle(th1);
     HANDLE th2 = CreateThread(NULL, 0, hid_notify_thread, NULL, 0, NULL);
     if (th2) CloseHandle(th2);
+    if (!g_refresh_event) {
+        g_refresh_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    }
+    HANDLE th3 = CreateThread(NULL, 0, refresher_thread, NULL, 0, NULL);
+    if (th3) CloseHandle(th3);
 }
 
 struct FindWinCtx {
@@ -613,12 +637,12 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
     HWND hwnd = ctx.hwnd;
     g_main_hwnd = hwnd;
 
-    BOOL dark = TRUE;
+    /* The title bar follows Windows' light or dark apps setting, as the Liquid Glass window does. */
+    DWORD light = 0, light_sz = sizeof(light);
+    BOOL dark = RegGetValueA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                             "AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &light, &light_sz) == ERROR_SUCCESS
+                   ? (light == 0) : TRUE;
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
-    COLORREF cap_color = RGB(0x0B, 0x0C, 0x0F);
-    DwmSetWindowAttribute(hwnd, 35, &cap_color, sizeof(cap_color));
-    COLORREF border_color = RGB(0x22, 0x26, 0x30);
-    DwmSetWindowAttribute(hwnd, 34, &border_color, sizeof(border_color));
 
     UINT dpi = 96;
     HMODULE u32 = GetModuleHandleA("user32.dll");
@@ -742,6 +766,15 @@ int32_t mousedpi_set_autostart(int32_t enable) {
     return mousedpi_get_autostart();
 }
 
+/* Ask the refresher thread to read the mouse now (returns at once). */
+void mousedpi_request_refresh(void) {
+    ensure_init();
+    start_watcher_once();
+    if (g_refresh_event) SetEvent(g_refresh_event);
+}
+
+int32_t mousedpi_state_rev(void) { return (int32_t)g_state_rev; }
+int32_t mousedpi_get_connected(void) { return g_connected; }
 int32_t mousedpi_get_dpi_x(void) { return g_dpi_x; }
 int32_t mousedpi_get_lod(void) { return g_lod; }
 int32_t mousedpi_get_battery(void) { return g_battery; }

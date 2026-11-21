@@ -1,0 +1,28 @@
+[package]
+name = "dpi_shots"
+version = "0.1.0"
+
+[dependencies]
+dpi_ui = { path = "../../packages/dpi_ui" }
+film = { path = "../../../deps/invar/packages/film" }
+host = { path = "../../../deps/invar/packages/host" }
+hostapi = { path = "../../../deps/invar/packages/hostapi" }
+lg = { path = "../../../deps/invar/packages/lg" }
+signals = { path = "../../../deps/invar/packages/signals" }
+ui = { path = "../../../deps/invar/packages/ui" }
+view = { path = "../../../deps/invar/packages/view" }
+
+[link.macos]
+frameworks = [
+  "Foundation",
+  "Cocoa",
+  "Metal",
+  "QuartzCore",
+  "CoreText",
+  "CoreGraphics",
+  "ImageIO",
+  "AVFoundation",
+  "CoreMedia",
+  "CoreVideo",
+  "WebKit",
+]

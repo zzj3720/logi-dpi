@@ -1,6 +1,6 @@
 # logi-dpi
 
-A tiny, instant-launch native Windows DPI controller for modern Logitech LIGHTSPEED gaming mice (**PRO X2 SUPERSTRIKE**, **PRO X Superlight 2**, etc.) built with **MoonBit + [mbui](https://github.com/AFK-surf/monoid)** and direct **Win32 USB HID++ 2.0** (`0x2202` Extended Adjustable DPI).
+A tiny, instant-launch native Windows DPI controller for modern Logitech LIGHTSPEED gaming mice (**PRO X2 SUPERSTRIKE**, **PRO X Superlight 2**, etc.) written in **[Pion](https://github.com/AFK-surf/pion)** with **invar**'s Liquid Glass components (`lg`) and direct **Win32 USB HID++ 2.0** (`0x2202` Extended Adjustable DPI).
 
 No Logitech G HUB. No "Loading resources…" infinite spinner. No background services. No Electron.
 
@@ -14,7 +14,8 @@ No Logitech G HUB. No "Loading resources…" infinite spinner. No background ser
 - **Lift-Off Distance (LOD)**: Switch between Low (`1`), Medium (`2`), and High (`3`) LOD directly on the sensor.
 - **Live Battery (`0x1004`)**: Reads Unified Battery percentage directly from the mouse.
 - **Auto-Save & Sleep/Wake Guard**: Saves your DPI & LOD to `config.ini`, minimizes to the Windows system tray on close, automatically restores your DPI if the mouse wakes from sleep or reconnects, and includes a one-click Windows autostart (`--tray`) toggle.
-- **Native GPU-Rendered UI**: Built with MoonBit `mbui` (Direct3D / Direct2D / DirectWrite) — ~4.3 MB single binary, instant cold start, native Windows 11 dark title bar.
+- **Liquid Glass UI**: one wallpaper with single-layer glass controls (slider, ±50 stepper, preset chips, LOD segmented control, toggle) from invar's `lg`, following its design laws (no glass on glass, concentric corners, ≥ 4.5:1 text); light or dark as Windows is. GPU-drawn by invar's Windows host (Direct3D 11 + DirectWrite).
+- **No HID I/O on the UI thread**: a background thread reads the mouse every 30 s or on Refresh; the window only takes the cached values.
 
 ## Quick Start (Windows x64)
 
@@ -33,11 +34,20 @@ No Logitech G HUB. No "Loading resources…" infinite spinner. No background ser
 
 ## Building from Source
 
-Requires [MoonBit](https://www.moonbitlang.com/), Visual Studio 2022 Build Tools (`x64`), and the `mbui` framework (`libs/mbui`):
+Layout: `pion/packages/dpi_ui` (the window, portable), `pion/cmd/mousedpi` (Windows app + `hidpp_win.c`),
+`pion/cmd/shots` (the window drawn offscreen on macOS with a stand-in mouse, for previews). `tools/deps.sh` fetches the
+pinned [invar](https://github.com/AFK-surf/invar) into `deps/invar`.
 
-1. Copy `src/mousedpi/` into `libs/mbui/src/mousedpi/`.
-2. Initialize VS 2022 x64 environment (`vcvars64.bat`) with `CL=/utf-8 /EHsc`.
-3. Build with `moon build --release --target native src/mousedpi` in the staged Windows module (`out/win/mod`).
+**Windows** (Git Bash): needs a `pionc.exe` + `qbe.exe` bootstrapped from the Pion repo (MinGW-w64 gcc, as its
+`scripts/test-windows.sh`), the [LLVM release](https://github.com/llvm/llvm-project/releases) for
+`x86_64-pc-windows-msvc`, and Visual Studio Build Tools (MSVC libraries + Windows SDK). invar's Windows host is written
+for MSVC, so it is compiled with clang for the MSVC target; `tools/win-cc.c` adapts pionc's GCC-style link flags.
+
+```sh
+PIONC=…/pionc.exe PION_QBE=…/qbe.exe PION_SRC=…/pion [LLVM_BIN=…/llvm/bin] sh tools/build-win.sh   # -> out/MouseDPI.exe
+```
+
+**macOS preview**: `sh tools/deps.sh && pionc build --release pion/cmd/shots -o dpi_shots && DPI_SHOTS=out DPI_PICTURE=$PWD/assets/mouse.png ./dpi_shots`
 
 ## License
 
