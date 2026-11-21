@@ -697,23 +697,22 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
                    ? (light == 0) : TRUE;
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
 
-    /* the window's size is the host's (window_setup); here it is only centred on its screen */
+    /* centred on its screen while it is still held out of sight (hostapi::window_hold: cloaked till the app shows it,
+     * show_held_window), so it comes up in place rather than jumping there; its size stays the host's */
     (void)logical_w;
     (void)logical_h;
     RECT wr;
     GetWindowRect(hwnd, &wr);
     int ww = wr.right - wr.left;
     int wh = wr.bottom - wr.top;
-
     HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi;
     mi.cbSize = sizeof(mi);
-    int x = 160, y = 120;
     if (GetMonitorInfoA(mon, &mi)) {
-        x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2;
-        y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2;
+        int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2;
+        int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2;
+        SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
     }
-    SetWindowPos(hwnd, NULL, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
 
     g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)tray_wndproc);
     add_tray_icon(hwnd);
@@ -725,18 +724,36 @@ int32_t mousedpi_setup_window(int32_t logical_w, int32_t logical_h) {
     return 1;
 }
 
+
+
 /* The host's window, styled and given its tray icon as soon as it is up: looked for here off the UI's thread (every
  * 50 ms, for up to a minute), not by the window's own frames, which do not run before it shows. */
+/* the host's: the window held out of sight as it opened (hostapi::window_hold) shown, and a frame asked for */
+extern void mb_host_window_show(void);
+extern void mb_host_request_frame(void);
+static DWORD g_ui_tid;
+
+static void show_held_window(void) {
+    mb_host_window_show();
+    mb_host_request_frame();
+    PostThreadMessageW(g_ui_tid, WM_NULL, 0, 0); /* wakes the UI's loop to draw it */
+}
+
 static DWORD WINAPI setup_thread(LPVOID unused) {
     (void)unused;
     for (int i = 0; i < 1200; i++) {
-        if (mousedpi_setup_window(0, 0)) return 0;
+        if (mousedpi_setup_window(0, 0)) {
+            show_held_window();
+            return 0;
+        }
         Sleep(50);
+        if (i == 60) show_held_window(); /* not found in 3 s: shown where it is */
     }
     return 0;
 }
 
 void mousedpi_setup_soon(void) {
+    g_ui_tid = GetCurrentThreadId();
     HANDLE th = CreateThread(NULL, 0, setup_thread, NULL, 0, NULL);
     if (th) CloseHandle(th);
 }

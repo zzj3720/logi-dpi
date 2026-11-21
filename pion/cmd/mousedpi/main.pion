@@ -77,6 +77,8 @@ fn main() -> Unit {
   // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
   // the system's: the Liquid Glass page is the whole window)
   hostapi::window_setup(640.0, 440.0, win_w.to_double(), win_h.to_double(), true)
+  // held out of sight till the C side has centred it (mousedpi_setup_soon shows it then)
+  hostapi::window_hold()
   let m = dpi_ui::Mouse::new()
   sync(m, c_init_and_restore())
   m.autostart.set(c_autostart() != 0)
