@@ -1,4 +1,4 @@
-// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, no cards), the
+// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, no cards; its controls `flat`), the
 // Liquid Glass floats over it (the PageShell's bar islands and the controls), never glass on glass. The page shell's top
 // bar is the window's title bar (the window has none of the system's). What the window shows comes from `Mouse`
 // (signals the worker's events write); what it asks goes to the worker (`Cmd`).
@@ -146,6 +146,7 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
           step={dpi_step}
           label="DPI ±50"
           show_value={false}
+          flat
         />
       </ui::Box>
     </ui::Row>
@@ -172,15 +173,16 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
     <ui::Col gap={0.0} rigid>
       <Hairline />
       <SettingRow name="常用档位">
-        <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
-        <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
-        <lg::Chip label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
-        <lg::Chip label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
-        <lg::Chip label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
+        <lg::Chip flat label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
+        <lg::Chip flat label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
+        <lg::Chip flat label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
+        <lg::Chip flat label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
+        <lg::Chip flat label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
       </SettingRow>
       <Hairline />
       <SettingRow name="抬起距离">
         <lg::Segmented
+          flat
           labels={["低", "中", "高"]}
           selected_by=>{
             let l = m.lod.get()
@@ -196,13 +198,14 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
       </SettingRow>
       <Hairline />
       <SettingRow name="开机自启">
-        <ui::Text size={12.0} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
-        <ui::Spacer />
         <lg::Toggle
           on_by=>{m.autostart.get()}
           on_change={fn(on : Bool) -> Unit { let _ = worker.send(Cmd::Autostart(on)) }}
           label="开机自启"
         />
+        <ui::Box pad_x={4.0}>
+          <ui::Text size={12.0} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
+        </ui::Box>
       </SettingRow>
     </ui::Col>
   </ui::Col>
