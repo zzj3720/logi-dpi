@@ -1,4 +1,4 @@
-// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, `SurfaceCard`), the
+// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, no cards), the
 // Liquid Glass floats over it (the PageShell's bar islands and the controls), never glass on glass. The page shell's top
 // bar is the window's title bar (the window has none of the system's). What the window shows comes from `Mouse`
 // (signals the worker's events write); what it asks goes to the worker (`Cmd`).
@@ -108,7 +108,7 @@ fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String) -> Unit {
 
 /// A row of the settings card: its name, then what sets it.
 fn SettingRow(parent : view::View, name~ : String, children~ : (view::View) -> Unit) -> Unit {
-  let _ = ui::Row(parent, align=.Middle, gap=12.0, height=52.0, pad_x=16.0, rigid=true, children=fn(r : view::View) -> Unit {
+  let _ = ui::Row(parent, align=.Middle, gap=12.0, height=52.0, pad_x=4.0, rigid=true, children=fn(r : view::View) -> Unit {
     <ui::Box in={r} width={72.0}>
       <ui::Text size={13.5} weight={500} color_by=>{ink()} text={name} />
     </ui::Box>
@@ -121,7 +121,7 @@ fn Hairline(parent : view::View) -> Unit {
   <ui::Box in={parent} height={0.5} bg_by=>{lg::surface().separator} rigid />
 }
 
-/// The right: the DPI read out large with its stepper and slider on the page, then one card of settings.
+/// The right: the DPI read out large with its stepper and slider on the page, then the settings as rows between hairlines.
 fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ : (Int, Int) -> Unit) -> Unit {
   let set_dpi = fn(v : Int) -> Unit {
     if v != m.dpi.untracked() {
@@ -169,7 +169,8 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="4000" />
       </ui::Row>
     </ui::Col>
-    <lg::SurfaceCard pad={0.0} radius={lg::r_row + 16.0} label="设置">
+    <ui::Col gap={0.0} rigid>
+      <Hairline />
       <SettingRow name="常用档位">
         <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
         <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
@@ -203,7 +204,7 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
           label="开机自启"
         />
       </SettingRow>
-    </lg::SurfaceCard>
+    </ui::Col>
   </ui::Col>
 }
 
