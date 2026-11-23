@@ -64,7 +64,8 @@ fn main(world : World) -> Int {
   // 780 × 360 points (what the page holds), no smaller than 640 × 340, the page the whole window (no title bar of the system's)
   hostapi::window_setup(640.0, 340.0, 780.0, 360.0, true)
   hostapi::window_center()
-  if c_started_hidden() != 0 {
+  let hidden = c_started_hidden() != 0
+  if hidden {
     // started with Windows: in the tray till it is brought back
     hostapi::window_hide()
   } else {
@@ -99,7 +100,10 @@ fn main(world : World) -> Int {
       "PRO X2 SUPERSTRIKE",
       fn(root : view::View) -> Unit {
         dpi_ui::app(root, m, worker, window_act=fn(w : Int) -> Unit { hostapi::window_act(w) }, reads~, picture="mouse.png")
-        hostapi::window_show()
+        // shown once its first frame is drawn, unless it started in the tray (brought back from there by the host)
+        if !hidden {
+          hostapi::window_show()
+        }
       },
       theme=lg::ui_theme,
     )
