@@ -1,5 +1,11 @@
 // MouseDPI for Windows: the Liquid Glass window (dpi_ui) over the HID++ 2.0 side (hidpp_win.c: the receiver, DPI/LOD,
-// battery, config.ini, tray, autostart, restoring the DPI as the mouse wakes).
+// battery, config.ini, autostart, restoring the DPI as the mouse wakes).
+//
+// The program is an app of invar's Windows host (MBUI_APP_ID in assets/mbui_env.txt): the host runs it once per person
+// (a second start brings the window back), puts the window away to its tray icon as it closes, and brings it back from
+// there; the tray menu is the app's (menu_setup). Two threads beside the window's: the worker does what the window
+// asks (ui::Worker), the watcher hands over each read of the mouse the C side's own threads did (every 30 s, after a
+// write, as the mouse wakes).
 
 import "dpi_ui"
 import "host"
@@ -8,13 +14,15 @@ import "lg"
 import "ui"
 import "view"
 
-extern "C" fn c_setup_soon() -> Unit = "mousedpi_setup_soon"
+extern "C" fn c_started_hidden() -> Int = "mousedpi_started_hidden"
 
-extern "C" fn c_single() -> Int = "mousedpi_single"
+extern "C" fn c_peek_config(which : Int) -> Int = "mousedpi_peek_config"
 
 extern "C" fn c_init_and_restore() -> Int = "mousedpi_init_and_restore"
 
 extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
+
+extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
 
 extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
 
@@ -22,11 +30,7 @@ extern "C" fn c_wait_rev(seen : Int) -> Int = "mousedpi_wait_rev"
 
 extern "C" fn c_stop_waits() -> Unit = "mousedpi_stop_waits"
 
-extern "C" fn c_peek_config(which : Int) -> Int = "mousedpi_peek_config"
-
 extern "C" fn c_connected() -> Int = "mousedpi_get_connected"
-
-extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
 
 extern "C" fn c_dpi_x() -> Int = "mousedpi_get_dpi_x"
 
@@ -38,76 +42,48 @@ extern "C" fn c_autostart() -> Int = "mousedpi_get_autostart"
 
 extern "C" fn c_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
 
-let win_w : Int = 780
-
-let win_h : Int = 500
-
-/// What a read of the mouse found, from the reader thread to the window's (`ok`: the receiver answered).
-struct Read {
-  ok : Int
-  dpi : Int
-  lod : Int
-  battery : Int
+/// The C side's last read, as the window takes it.
+fn read_now(ok : Int) -> dpi_ui::Ev {
+  dpi_ui::Ev::Read(ok != 0, c_dpi_x(), c_lod(), c_battery())
 }
 
-fn read_now(ok : Int) -> Read {
-  Read::{ ok, dpi: c_dpi_x(), lod: c_lod(), battery: c_battery() }
-}
-
-/// When the window last asked for a DPI/LOD (hostapi::now): what the C side read back before that write lands is
-/// older than what is shown, so it is not taken for a while.
-let last_asked : Array[Double] = [-100000.0]
-
-/// A read into the window's signals.
-fn take(m : dpi_ui::Mouse, r : Read) -> Unit {
-  m.connected.set(r.ok != 0)
-  if r.ok != 0 {
-    if hostapi::now() - last_asked[0] > 1500.0 {
-      m.dpi.set(r.dpi)
-      m.lod.set(r.lod)
-    }
-    m.battery.set(r.battery)
+/// What the window asks, on the worker's thread (none of it blocks: the C side's refresher thread does the HID++).
+fn handle(cmd : dpi_ui::Cmd, emit : (dpi_ui::Ev) -> Unit) -> Unit {
+  match cmd {
+    dpi_ui::Cmd::Refresh => c_request_refresh()
+    dpi_ui::Cmd::Set(dpi, lod) => c_request_set(dpi, lod)
+    dpi_ui::Cmd::Autostart(on) => emit(dpi_ui::Ev::Autostarts(c_set_autostart(if on { 1 } else { 0 }) != 0))
   }
 }
+
+/// The tray icon's menu (the host's icon; its words the app's).
+let tray_menu : String = "[{\"role\":\"tray\",\"items\":[{\"title\":\"打开 MouseDPI\",\"role\":\"show\"},{\"separator\":true},{\"title\":\"退出\",\"role\":\"quit\"}]}]"
 
 fn main(world : World) -> Int {
-  // one MouseDPI at a time: a second start brings the running one to the front and ends
-  if c_single() == 0 {
-    return 0
-  }
   host::install()
-  // the window as the app opens it: 780 × 500 points, no smaller than 640 × 440, its top row the app's (no title bar of
-  // the system's: the Liquid Glass page is the whole window)
-  hostapi::window_setup(640.0, 440.0, win_w.to_double(), win_h.to_double(), true)
-  // held out of sight till the C side has centred it (mousedpi_setup_soon shows it then)
-  hostapi::window_hold()
-  // shown as config.ini last had it till the mouse answers (read on the reader thread, not this one; opening the
-  // receiver there can take ~350 ms while the GPU's driver loads beside it): taken as there, not "未连接" for a moment
+  // 780 × 376 points (what the page holds), no smaller than 640 × 360, the page the whole window (no title bar of the system's)
+  hostapi::window_setup(640.0, 360.0, 780.0, 376.0, true)
+  hostapi::window_center()
+  if c_started_hidden() != 0 {
+    // started with Windows: in the tray till it is brought back
+    hostapi::window_hide()
+  } else {
+    // out of sight till its first frame is drawn, centred, then shown (no jump, no blank window)
+    hostapi::window_hold()
+  }
+  hostapi::menu_setup(tray_menu)
+  // shown as config.ini last had it till the mouse answers (opening the receiver can take ~350 ms while the GPU's
+  // driver loads beside it): taken as there, not "未连接" for a moment
   let m = dpi_ui::Mouse::new()
   m.connected.set(true)
   m.dpi.set(c_peek_config(0))
   m.lod.set(c_peek_config(1))
   m.autostart.set(c_autostart() != 0)
-  let d = dpi_ui::Device::{
-    refresh: fn() { c_request_refresh() },
-    // shown at once; written by the C side's thread (the newest asked), its read back taken as the reader brings it
-    set_dpi: fn(x : Int, lod : Int) -> Unit {
-      last_asked[0] = hostapi::now()
-      m.dpi.set(x)
-      m.lod.set(lod)
-      c_request_set(x, lod)
-    },
-    set_autostart: fn(on : Bool) -> Unit { m.autostart.set(c_set_autostart(if on { 1 } else { 0 }) != 0) },
-    window_act: fn(what : Int) -> Unit { hostapi::window_act(what) },
-  }
-  // the mouse read off this thread: the reader opens it (putting back the DPI config.ini keeps), then waits for each
-  // read the C side's refresher does (every 30 s, when asked, a DPI the wake guard put back) and hands it over, the
-  // window woken for it (ui::EventQueue: taken before the next frame, from inside the tree's maker: ui::run forgets
-  // hooks set before it)
-  let reads : ui::EventQueue[Read] = ui::EventQueue::new()
-  // the window styled and given its tray icon by the C side as soon as it is up (raw input, power, close to tray)
-  c_setup_soon()
+  let (worker, ctx) : (ui::Worker[dpi_ui::Cmd, dpi_ui::Ev], ui::WorkerCtx[dpi_ui::Cmd, dpi_ui::Ev]) = ui::Worker::pair()
+  let reads : ui::EventQueue[dpi_ui::Ev] = ui::EventQueue::new()
   scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit { ctx.run_loop(handle) })
+    // the watcher: the mouse opened (the DPI config.ini keeps put back), then each read the C side does handed over
     spawn(s, fn() -> Unit {
       let first = c_init_and_restore()
       reads.emit(read_now(first))
@@ -122,11 +98,12 @@ fn main(world : World) -> Int {
     ui::run(
       "PRO X2 SUPERSTRIKE",
       fn(root : view::View) -> Unit {
-        let _ = ui::on_before_frame(fn() { let _ = reads.drain(fn(r : Read) { take(m, r) }) })
-        dpi_ui::app(root, m, d, picture="mouse.png")
+        dpi_ui::app(root, m, worker, window_act=fn(w : Int) -> Unit { hostapi::window_act(w) }, reads~, picture="mouse.png")
+        hostapi::window_show()
       },
       theme=lg::ui_theme,
     )
+    worker.close()
     c_stop_waits()
   })
   0

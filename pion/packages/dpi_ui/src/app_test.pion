@@ -1,0 +1,74 @@
+// The window over a stand-in mouse (`Worker::inline`): invar's Apple two-layer gate (no glass on glass, content layer
+// solid, nothing unscrollable, craft) light and dark, connected and not, and what each control asks of the worker.
+
+import "lg"
+import "ui"
+import "view"
+
+fn window(m : Mouse, worker : ui::Worker[Cmd, Ev], acts : Array[Int]) -> ui::Tester {
+  ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      app(root, m, worker, window_act=fn(w : Int) -> Unit { acts.push(w) }, picture="")
+    },
+    width=780.0,
+    height=376.0,
+    theme=lg::ui_theme,
+  )
+}
+
+test "dpi window passes the apple two-layer gate, light and dark, connected and not" {
+  for dark in [false, true] {
+    for connected in [true, false] {
+      lg::set_dark(Some(dark))
+      let m = Mouse::new()
+      m.connected.set(connected)
+      m.dpi.set(1600)
+      m.battery.set(if connected { 76 } else { -1 })
+      let worker = ui::Worker::inline(stand_in(76))
+      let t = window(m, worker, [])
+      t.frame()
+      debug_assert(t.find("PRO X2 SUPERSTRIKE").is_some(), "the title is shown")
+      debug_assert(t.find("1600").is_some(), "the DPI is read out")
+      debug_assert(t.find("电量 76%").is_some() == connected, "the battery shows only while connected")
+      lg::assert_apple_ui(t, label="dpi_dark_\{dark}_connected_\{connected}")
+      worker.close()
+      t.dispose()
+    }
+  }
+  lg::set_dark(None)
+}
+
+test "the controls ask the worker, and its reads come back into the window" {
+  lg::set_dark(Some(true))
+  let m = Mouse::new()
+  m.connected.set(true)
+  let worker = ui::Worker::inline(stand_in(55))
+  let acts : Array[Int] = []
+  let t = window(m, worker, acts)
+  t.frame()
+  // a preset: shown at once, written (the stand-in reads back what was written)
+  t.press("1200")
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 1200, "a preset sets the DPI, got \{m.dpi.untracked()}")
+  // lift-off distance
+  t.press("高")
+  t.frame(ms=16.0)
+  debug_assert(m.lod.untracked() == 3, "the segmented control sets LOD 3, got \{m.lod.untracked()}")
+  debug_assert(m.dpi.untracked() == 1200, "the DPI stays as LOD changes")
+  // refresh: a read with the battery comes back
+  t.press("刷新")
+  t.frame(ms=16.0)
+  debug_assert(m.battery.untracked() == 55, "refresh reads the battery, got \{m.battery.untracked()}")
+  // start with Windows: what the worker says it is now
+  t.press("开机自启")
+  t.frame(ms=16.0)
+  debug_assert(m.autostart.untracked(), "the toggle asks for autostart and takes the worker's answer")
+  // the window's own buttons
+  t.press("最小化")
+  t.press("关闭到托盘")
+  debug_assert(acts.length() == 2 && acts[0] == 1 && acts[1] == 3, "minimize is 1, close (to the tray) is 3")
+  lg::assert_apple_ui(t, label="dpi_after_controls")
+  worker.close()
+  t.dispose()
+  lg::set_dark(None)
+}

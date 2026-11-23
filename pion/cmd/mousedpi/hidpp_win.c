@@ -1,9 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dwmapi.h>
-#include <shellapi.h>
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <powrprof.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,15 +10,10 @@
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
-#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "powrprof.lib")
 
-#define WM_TRAYICON (WM_APP + 42)
-#define ID_TRAY_SHOW 1001
-#define ID_TRAY_QUIT 1002
-#define WM_SHOW_ME (WM_APP + 43) /* another start of the program: come to the front */
 
 static CRITICAL_SECTION g_hid_cs;
 static int32_t g_cs_inited = 0;
@@ -35,16 +29,11 @@ static int32_t g_has_saved = 0;
 static int32_t g_saved_dpi = 800;
 static int32_t g_saved_lod = 2;
 
-static int32_t g_win_styled = 0;
 static int32_t g_cwd_set = 0;
 static int32_t g_watcher_started = 0;
 static char g_exe_path[MAX_PATH] = {0};
 static char g_cfg_path[MAX_PATH] = {0};
 
-static HWND g_main_hwnd = NULL;
-static WNDPROC g_orig_wndproc = NULL;
-static NOTIFYICONDATAW g_nid;
-static int32_t g_tray_added = 0;
 
 static HANDLE g_wake_event = NULL;
 static volatile ULONGLONG g_last_mouse_tick = 0;
@@ -84,15 +73,6 @@ static void ensure_init(void) {
                 snprintf(g_cfg_path, MAX_PATH, "%s\\config.ini", dir);
             }
         }
-        /* the folder whose shaders/ keeps the host's compiled shaders (MBUI_SHADERS in the program's MBUI_ENV
-         * resource): its parent is ours to make */
-        char local[MAX_PATH];
-        DWORD ln = GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH);
-        if (ln > 0 && ln < MAX_PATH - 16) {
-            char app[MAX_PATH];
-            snprintf(app, MAX_PATH, "%s\\MouseDPI", local);
-            CreateDirectoryA(app, NULL);
-        }
     }
 }
 
@@ -110,101 +90,8 @@ static void save_config(int32_t dpi, int32_t lod) {
     }
 }
 
-static void update_tray_tip(void) {
-    if (!g_tray_added || !g_main_hwnd) return;
-    swprintf(g_nid.szTip, 128, L"PRO X2 SUPERSTRIKE - %d DPI", g_dpi_x);
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-}
-
-static void remove_tray_icon(void) {
-    if (g_tray_added) {
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
-        g_tray_added = 0;
-    }
-}
-
-static void show_held_window(void);
-
-/* The window brought up: shown (out of hiding; uncloaked if it was held from the start, --tray), restored, in front. */
-static void bring_up(HWND hwnd) {
-    show_held_window();
-    ShowWindow(hwnd, SW_SHOW);
-    ShowWindow(hwnd, SW_RESTORE);
-    SetForegroundWindow(hwnd);
-}
-
-static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_POWERBROADCAST) {
-        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
-            if (g_has_saved) signal_wake_restore();
-        }
-        return CallWindowProcW(g_orig_wndproc, hwnd, msg, wp, lp);
-    }
-    if (msg == WM_CLOSE) {
-        ShowWindow(hwnd, SW_HIDE);
-        return 0;
-    }
-    if (msg == WM_SHOW_ME) {
-        bring_up(hwnd);
-        return 0;
-    }
-    if (msg == WM_TRAYICON) {
-        UINT ev = (UINT)(lp & 0xFFFF);
-        if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) {
-            bring_up(hwnd);
-            return 0;
-        }
-        if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU menu = CreatePopupMenu();
-            if (menu) {
-                AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, L"\x6253\x5F00 MouseDPI");
-                AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"\x9000\x51FA");
-                SetForegroundWindow(hwnd);
-                UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(menu);
-                if (cmd == ID_TRAY_SHOW) {
-                    bring_up(hwnd);
-                } else if (cmd == ID_TRAY_QUIT) {
-                    remove_tray_icon();
-                    ExitProcess(0);
-                }
-            }
-            return 0;
-        }
-    }
-    if (msg == WM_DESTROY) {
-        remove_tray_icon();
-    }
-    return CallWindowProcW(g_orig_wndproc, hwnd, msg, wp, lp);
-}
-
-static void add_tray_icon(HWND hwnd) {
-    if (g_tray_added) return;
-    HINSTANCE hInst = GetModuleHandleW(NULL);
-    HICON hSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
-    HICON hBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
-    if (!hSmall) hSmall = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
-    if (!hBig) hBig = hSmall;
-    SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hBig);
-    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
-
-    memset(&g_nid, 0, sizeof(g_nid));
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = hSmall;
-    swprintf(g_nid.szTip, 128, L"PRO X2 SUPERSTRIKE - %d DPI", g_dpi_x);
-    if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
-        g_tray_added = 1;
-    }
-}
-
-static int has_tray_arg(void) {
+/* Started with Windows (the Run key's --tray): kept in the tray till brought back. */
+int32_t mousedpi_started_hidden(void) {
     const char *cmd = GetCommandLineA();
     if (!cmd) return 0;
     return strstr(cmd, "--tray") != NULL;
@@ -584,9 +471,6 @@ static DWORD WINAPI wake_watcher_thread(LPVOID unused) {
             if (restored) break;
             if (attempt < 3) Sleep(retry_delays[attempt]);
         }
-        if (restored) {
-            update_tray_tip();
-        }
     }
     return 0;
 }
@@ -664,14 +548,24 @@ static DWORD WINAPI refresher_thread(LPVOID unused) {
         }
         LeaveCriticalSection(&g_hid_cs);
         bump_rev();
-        update_tray_tip();
-    }
+        }
+    return 0;
+}
+
+/* The PC woke (the system's suspend/resume notification, no window needed): the DPI put back, as when the mouse wakes. */
+static ULONG CALLBACK power_said(PVOID ctx, ULONG type, PVOID setting) {
+    (void)ctx;
+    (void)setting;
+    if ((type == PBT_APMRESUMEAUTOMATIC || type == PBT_APMRESUMESUSPEND) && g_has_saved) signal_wake_restore();
     return 0;
 }
 
 static void start_watcher_once(void) {
     if (InterlockedCompareExchange((volatile LONG *)&g_watcher_started, 1, 0) != 0) return;
     g_last_mouse_tick = GetTickCount64();
+    static DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS power = {power_said, NULL};
+    HPOWERNOTIFY ignored = NULL;
+    PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, &power, &ignored);
     HANDLE th1 = CreateThread(NULL, 0, wake_watcher_thread, NULL, 0, NULL);
     if (th1) CloseHandle(th1);
     HANDLE th2 = CreateThread(NULL, 0, hid_notify_thread, NULL, 0, NULL);
@@ -680,106 +574,6 @@ static void start_watcher_once(void) {
     if (th3) CloseHandle(th3);
     HANDLE th4 = CreateThread(NULL, 0, raw_input_thread, NULL, 0, NULL);
     if (th4) CloseHandle(th4);
-}
-
-/* The host's window styled (title bar colours, centred, closed to the tray, its tray icon), on the window's thread. */
-static void style_window(HWND hwnd) {
-    ensure_init();
-    g_main_hwnd = hwnd;
-
-    /* The title bar follows Windows' light or dark apps setting, as the Liquid Glass window does. */
-    DWORD light = 0, light_sz = sizeof(light);
-    BOOL dark = RegGetValueA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                             "AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &light, &light_sz) == ERROR_SUCCESS
-                   ? (light == 0) : TRUE;
-    DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
-
-    /* centred on its screen while it is still held out of sight (hostapi::window_hold: cloaked till the app shows it,
-     * show_held_window), so it comes up in place rather than jumping there; its size stays the host's */
-    RECT wr;
-    GetWindowRect(hwnd, &wr);
-    int ww = wr.right - wr.left;
-    int wh = wr.bottom - wr.top;
-    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoA(mon, &mi)) {
-        int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2;
-        int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2;
-        SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
-    }
-
-    g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)tray_wndproc);
-    add_tray_icon(hwnd);
-    start_watcher_once();
-    g_win_styled = 1;
-}
-
-
-
-/* The host's window, styled and given its tray icon as soon as it is up: looked for here off the UI's thread (every
- * 10 ms, for up to a minute), not by the window's own frames, which do not run before it shows. */
-/* One MouseDPI per person: a second start hands over to the one running (brings its window to the front, unless it
- * was started for the tray) and ends, before any window of its own. 1: this is the one that runs. */
-int32_t mousedpi_single(void) {
-    HANDLE m = CreateMutexW(NULL, TRUE, L"Local\\MouseDPI.single");
-    if (m && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (!has_tray_arg()) {
-            HWND other = FindWindowW(L"mbui", L"PRO X2 SUPERSTRIKE");
-            if (other) {
-                AllowSetForegroundWindow(ASFW_ANY);
-                PostMessageW(other, WM_SHOW_ME, 0, 0);
-            }
-        }
-        return 0;
-    }
-    return 1;
-}
-
-/* the host's: the window held out of sight as it opened (hostapi::window_hold) shown, and a frame asked for */
-extern void mb_host_window_show(void);
-extern void mb_host_request_frame(void);
-static DWORD g_ui_tid;
-
-static void show_held_window(void) {
-    mb_host_window_show();
-    mb_host_request_frame();
-    PostThreadMessageW(g_ui_tid, WM_NULL, 0, 0); /* wakes the UI's loop to draw it */
-}
-
-/* The window styled as the host first shows it (ShowWindow, cloaked: hostapi::window_hold), on the window's thread,
- * before its first frame: a hook of that thread's sent messages sees its WM_SHOWWINDOW. Then shown as that frame is
- * on the screen, or, started --tray, kept held and hidden till it is brought up (bring_up). Looked for from another
- * thread before (every 10 ms): its styling waited on the window's thread till its first frames were done, ~60 ms. */
-static HHOOK g_show_hook;
-static LRESULT CALLBACK show_hook(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && !g_win_styled) {
-        const CWPSTRUCT *m = (const CWPSTRUCT *)lp;
-        if (m->message == WM_SHOWWINDOW && m->wParam && GetWindow(m->hwnd, GW_OWNER) == NULL &&
-            !(GetWindowLongPtrW(m->hwnd, GWL_STYLE) & WS_CHILD)) {
-            style_window(m->hwnd);
-            if (has_tray_arg()) PostMessageW(m->hwnd, WM_CLOSE, 0, 0); /* hidden to the tray (tray_wndproc) */
-            else show_held_window();
-            UnhookWindowsHookEx(g_show_hook);
-            g_show_hook = NULL;
-        }
-    }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-
-/* (where no WM_SHOWWINDOW was seen in 3 s: shown where it is, unstyled, rather than held out of sight for good) */
-static DWORD WINAPI setup_fallback(LPVOID unused) {
-    (void)unused;
-    Sleep(3000);
-    if (!g_win_styled) show_held_window();
-    return 0;
-}
-
-void mousedpi_setup_soon(void) {
-    g_ui_tid = GetCurrentThreadId();
-    g_show_hook = SetWindowsHookExW(WH_CALLWNDPROC, show_hook, NULL, g_ui_tid);
-    HANDLE th = CreateThread(NULL, 0, setup_fallback, NULL, 0, NULL);
-    if (th) CloseHandle(th);
 }
 
 int32_t mousedpi_init_and_restore(void) {
@@ -801,7 +595,6 @@ int32_t mousedpi_init_and_restore(void) {
         save_config(g_dpi_x, g_lod);
     }
     LeaveCriticalSection(&g_hid_cs);
-    update_tray_tip();
     start_watcher_once();
     return ok;
 }
@@ -811,7 +604,6 @@ int32_t mousedpi_read_state(void) {
     EnterCriticalSection(&g_hid_cs);
     int32_t ok = read_state_locked();
     LeaveCriticalSection(&g_hid_cs);
-    update_tray_tip();
     return ok;
 }
 
@@ -823,7 +615,6 @@ int32_t mousedpi_set_dpi(int32_t x, int32_t y, int32_t lod) {
         save_config(g_dpi_x, g_lod);
     }
     LeaveCriticalSection(&g_hid_cs);
-    update_tray_tip();
     return rc;
 }
 

@@ -1,12 +1,15 @@
-// MouseDPI's window: one wallpaper (the Content Layer) with single-layer Liquid Glass controls floating on it
-// (invar's `lg`, DESIGN.md's laws: no glass inside glass, concentric corners, ≥ 4.5:1 words, closed-form motion).
-// What the window shows comes from `Mouse` (signals the device side writes); what it asks goes through `Device`.
+// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, `SurfaceCard`), the
+// Liquid Glass floats over it (the PageShell's bar islands and the controls), never glass on glass. The page shell's top
+// bar is the window's title bar (the window has none of the system's). What the window shows comes from `Mouse`
+// (signals the worker's events write); what it asks goes to the worker (`Cmd`).
 
+import "hostapi"
 import "lg"
 import "signals"
+import "ui"
 import "view"
 
-/// What the window knows of the mouse; the device side writes it, the window reads it.
+/// What the window knows of the mouse.
 pub struct Mouse {
   pub connected : signals::Signal[Bool]
   pub dpi : signals::Signal[Int]
@@ -25,18 +28,6 @@ pub fn Mouse::new() -> Mouse {
   }
 }
 
-/// What the window asks of the mouse.
-pub struct Device {
-  /// Read the mouse again (DPI, LOD, battery) into `Mouse`.
-  pub refresh : () -> Unit
-  /// Write DPI (both axes) and lift-off distance (1 low, 2 medium, 3 high).
-  pub set_dpi : (Int, Int) -> Unit
-  /// Start with Windows (in the tray) or not.
-  pub set_autostart : (Bool) -> Unit
-  /// The window's own buttons (the window has no title bar of the system's): 1 minimize, 3 close (to the tray).
-  pub window_act : (Int) -> Unit
-}
-
 /// The slider's range and step (the sensor takes 100–44000; the hand wants 200–4000 in 50s).
 pub let dpi_least : Int = 200
 
@@ -44,256 +35,209 @@ pub let dpi_most : Int = 4000
 
 pub let dpi_step : Int = 50
 
-let presets : Array[Int] = [400, 800, 1200, 1600, 3200]
+/// How long after the window asks for a DPI/LOD a read is not taken for them (hostapi::now ms): a read the device side
+/// did before the write landed is older than what is shown.
+let settle_ms : Double = 1500.0
 
-
-fn ink_strong() -> Int64 {
-  lg::colors().content
+fn ink() -> Int64 {
+  lg::surface().ink
 }
 
-fn ink_muted() -> Int64 {
-  lg::alpha(lg::colors().content, 0.72)
+fn ink_secondary() -> Int64 {
+  lg::surface().ink_secondary
 }
 
-fn ink_faint() -> Int64 {
-  lg::alpha(lg::colors().content, 0.62)
+fn ink_tertiary() -> Int64 {
+  lg::surface().ink_tertiary
 }
 
-/// A line of words in `size`/`weight` and `ink`.
-fn say(parent : view::View, text : () -> String, size : Double, weight~ : Int = 400, ink~ : () -> Int64 = ink_strong) -> Unit {
-  let _ = parent.box(fn(w : view::View) -> Unit {
-    let _ = w.words(view::Live::By(text), look=lg::words_at(size, weight=weight)).ink(view::Live::By(ink))
-  })
-}
-
-/// A section's small heading.
-fn heading(parent : view::View, text : String) -> Unit {
-  say(parent, fn() { text }, 12.0, weight=600, ink=ink_muted)
-}
-
-/// The wallpaper the glass bends: a deep ground with three soft colour fields (Logitech-ish cyan, violet, blue).
-fn wallpaper(root : view::View) -> Unit {
-  let _ = root.box(fn(paper : view::View) -> Unit {
-    let _ = paper
-      .over(view::Live::Is(true))
-      .clips(view::Live::Is(true))
-      .points(view::Live::Is(false))
-      .ground(view::Live::By(fn() { if lg::is_dark() { 0x0A0B10FFL } else { 0xF3F4F7FFL } }))
-    let blots : Array[(Double, Double, Double, Int64, Int64)] = [
-      (-120.0, -160.0, 460.0, 0x7DD3FCFFL, 0x0E7490FFL),
-      (420.0, -200.0, 520.0, 0xC4B5FDFFL, 0x6D28D9FFL),
-      (180.0, 260.0, 520.0, 0x93C5FDFFL, 0x1D4ED8FFL),
-    ]
-    for bi = 0; bi < blots.length(); bi = bi + 1 {
-      let b = blots[bi]
-      let cx = b.0 + b.2 / 2.0
-      let cy = b.1 + b.2 / 2.0
-      let layers = 18
-      for k = 0; k < layers; k = k + 1 {
-        let t = k.to_double() / (layers - 1).to_double()
-        let ld = b.2 * (1.76 - 1.60 * t)
-        let a = 0.020 + 0.022 * t
-        let light = b.3
-        let dark = b.4
-        let _ = paper.box(fn(c : view::View) -> Unit {
-          let _ = c
-            .over(view::Live::Is(true))
-            .width(view::Live::Is(Some(ld)))
-            .height(view::Live::Is(Some(ld)))
-            .radius(view::Live::Is(ld / 2.0))
-            .offset(view::Live::Is((cx - ld / 2.0, cy - ld / 2.0)))
-            .ground(view::Live::By(fn() { lg::alpha(if lg::is_dark() { dark } else { light }, a) }))
-        })
+/// The worker's events into `m` (bound before every frame; `asked_at[0]` is when the window last asked for a DPI/LOD).
+fn take(m : Mouse, asked_at : Array[Double], ev : Ev) -> Unit {
+  match ev {
+    Ev::Read(ok, dpi, lod, battery) => {
+      m.connected.set(ok)
+      if ok {
+        if hostapi::now() - asked_at[0] > settle_ms {
+          m.dpi.set(dpi)
+          m.lod.set(lod)
+        }
+        m.battery.set(battery)
       }
     }
-  })
+    Ev::Autostarts(on) => m.autostart.set(on)
+  }
 }
 
-/// The top: the mouse's name and link on the wallpaper (content), a battery badge and a refresh orb (glass) at the end.
-fn top_bar(page : view::View, m : Mouse, d : Device) -> Unit {
-  let _ = page.box(fn(bar : view::View) -> Unit {
-    // the window's title bar (it has none of the system's): a press on it, not on a control, moves the window
-    let _ = bar
-      .moves_window(view::Live::Is(true))
-      .row(view::Live::Is(true))
-      .height(view::Live::Is(Some(56.0)))
-      .lies_along(view::Live::Is(view::Lies::Between))
-      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-    let _ = bar.box(fn(title : view::View) -> Unit {
-      let _ = title.gap(view::Live::Is(2.0))
-      say(title, fn() { "PRO X2 SUPERSTRIKE" }, 17.0, weight=700)
-      say(title, fn() { if m.connected.get() { "LIGHTSPEED · HID++ 2.0 直连" } else { "未连接 · 正在找接收器" } }, 12.5, ink=ink_muted)
-    })
-    let _ = bar.box(fn(t : view::View) -> Unit {
-      let _ = t.row(view::Live::Is(true)).gap(view::Live::Is(10.0)).lines_up(view::Live::Is(Some(view::Along::Middle)))
-      let _ = t.box(fn(slot : view::View) -> Unit {
-        slot.show(fn() { m.connected.get() && m.battery.get() >= 0 }, fn(s : view::View) -> Unit {
-          let _ = lg::liquid_badge_node(
-            s,
-            fn() { "电量 \{m.battery.get()}%" },
-            tone=if m.battery.get() <= 20 { lg::LiquidTone::Warning } else { lg::LiquidTone::Success },
-            dot=true,
-          )
-        })
-      })
-      let _ = lg::liquid_icon_button_node(
-        t,
-        fn() { "刷新" },
-        fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_refresh_data, 18.0, ink) },
-        fn() { (d.refresh)() },
-        size=lg::LiquidButtonSize::Small,
-      )
-      // the window's own buttons, one small glass group
-      let _ = lg::liquid_button_group_node(
-        t,
-        fn() {
-          [
-            lg::LiquidGroupAction::new(
-              label=fn() { "最小化" },
-              icon=fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_minus_data, 16.0, ink) },
-              press=fn() { (d.window_act)(1) },
-            ),
-            lg::LiquidGroupAction::new(
-              label=fn() { "关闭到托盘" },
-              icon=fn(ic : view::View, ink : () -> Int64) -> Unit { icon_node(ic, icon_close_data, 16.0, ink) },
-              press=fn() { (d.window_act)(3) },
-            ),
-          ]
-        },
-        size=lg::LiquidButtonSize::Small,
-      )
-    })
-  })
+/// The top bar's islands: the battery, refresh, and the window's own minimize / close (to the tray).
+fn bar_islands(tr : view::View, m : Mouse, worker : ui::Worker[Cmd, Ev], window_act : (Int) -> Unit) -> Unit {
+  <ui::Show in={tr} when=>{m.connected.get() && m.battery.get() >= 0} at_once>
+    <lg::Badge
+      label_by=>{"电量 \{m.battery.get()}%"}
+      tone={if m.battery.get() <= 20 { .Warning } else { .Success }}
+      dot
+    />
+  </ui::Show>
+  <lg::BarPillGroup in={tr} height={36.0} label="鼠标">
+    <lg::Button flat ghost height={32.0} pad_x={10.5} label="刷新" on_press=>{ let _ = worker.send(Cmd::Refresh) }>
+      <lg::Icon kind={.Refresh} size={15.0} />
+    </lg::Button>
+  </lg::BarPillGroup>
+  <lg::BarPillGroup in={tr} height={36.0} label="窗口">
+    <lg::Button flat ghost height={32.0} pad_x={10.5} label="最小化" on_press=>{ window_act(1) }>
+      <lg::Icon kind={.Minus} size={15.0} />
+    </lg::Button>
+    <lg::Button flat ghost height={32.0} pad_x={10.5} label="关闭到托盘" on_press=>{ window_act(3) }>
+      <lg::Icon kind={.Close} size={15.0} />
+    </lg::Button>
+  </lg::BarPillGroup>
 }
 
-/// The left: the mouse itself on the wallpaper (content, no glass) and starting with Windows.
-fn mouse_column(body : view::View, m : Mouse, d : Device, picture : String) -> Unit {
-  let _ = body.box(fn(col : view::View) -> Unit {
-    let _ = col
-      .width(view::Live::Is(Some(228.0)))
-      .shrink(view::Live::Is(0.0))
-      .gap(view::Live::Is(18.0))
-      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      .lies_along(view::Live::Is(view::Lies::Middle))
-    let _ = col.box(fn(pic : view::View) -> Unit {
-      let _ = pic
-        .width(view::Live::Is(Some(140.0)))
-        .height(view::Live::Is(Some(210.0)))
-        .image(view::Live::Is(Some((picture, "", 640))))
-        .alpha(view::Live::By(fn() { if m.connected.get() { 1.0 } else { 0.45 } }))
-    })
-    let _ = col.box(fn(row : view::View) -> Unit {
-      let _ = row
-        .row(view::Live::Is(true))
-        .gap(view::Live::Is(12.0))
-        .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      say(row, fn() { "开机自启" }, 14.0, weight=500)
-      let _ = lg::liquid_toggle_node(row, fn() { m.autostart.get() }, fn(on : Bool) -> Unit { (d.set_autostart)(on) }, fn() { "开机自启" })
-    })
-    say(col, fn() { "改动自动保存 · 唤醒后自动恢复" }, 11.5, ink=ink_faint)
-  })
+/// The left card: the mouse, whether it is there, and starting with Windows.
+fn MouseCard(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], picture~ : String) -> Unit {
+  <lg::SurfaceCard in={parent} pad={16.0} gap={14.0} label="鼠标">
+    <ui::Col align={.Middle} gap={10.0} width={188.0} rigid>
+      <ui::Box width={112.0} height={168.0} alpha_by=>{if m.connected.get() { 1.0 } else { 0.45 }}>
+        <ui::Image src={picture} width={112.0} height={168.0} contain max_px={640} />
+      </ui::Box>
+      <ui::Text
+        size={12.5}
+        color_by=>{ink_secondary()}
+        text_by=>{if m.connected.get() { "LIGHTSPEED · HID++ 2.0" } else { "未连接 · 正在找接收器" }}
+      />
+    </ui::Col>
+    <ui::Row align={.Middle} gap={12.0} rigid>
+      <ui::Text size={14.0} weight={500} color_by=>{ink()} text="开机自启" />
+      <ui::Spacer />
+      <lg::Toggle
+        on_by=>{m.autostart.get()}
+        on_change={fn(on : Bool) -> Unit { let _ = worker.send(Cmd::Autostart(on)) }}
+        label="开机自启"
+      />
+    </ui::Row>
+    <ui::Text size={11.5} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
+  </lg::SurfaceCard>
 }
 
-/// The right: the DPI read out large, the slider, ±50, presets and lift-off distance, each a glass island.
-fn dpi_column(body : view::View, m : Mouse, d : Device) -> Unit {
+/// The right: the DPI read out large with its stepper and slider, then presets and lift-off distance.
+fn DpiCards(parent : view::View, m~ : Mouse, ask~ : (Int, Int) -> Unit) -> Unit {
   let set_dpi = fn(v : Int) -> Unit {
-    if v != m.dpi.get() {
-      (d.set_dpi)(v, m.lod.get())
+    if v != m.dpi.untracked() {
+      ask(v, m.lod.untracked())
     }
   }
-  let _ = body.box(fn(col : view::View) -> Unit {
-    let _ = col.grow(view::Live::Is(1.0)).gap(view::Live::Is(14.0)).lies_along(view::Live::Is(view::Lies::Middle))
-    // The read-out and the stepper on one line.
-    let _ = col.box(fn(head : view::View) -> Unit {
-      let _ = head
-        .row(view::Live::Is(true))
-        .lies_along(view::Live::Is(view::Lies::Between))
-        .lines_up(view::Live::Is(Some(view::Along::End)))
-      let _ = head.box(fn(num : view::View) -> Unit {
-        let _ = num.row(view::Live::Is(true)).gap(view::Live::Is(8.0)).lines_up(view::Live::Is(Some(view::Along::End)))
-        say(num, fn() { m.dpi.get().to_string() }, 64.0, weight=700)
-        let _ = num.box(fn(unit : view::View) -> Unit {
-          let _ = unit.padding(view::Live::Is((0.0, 0.0, 0.0, 14.0)))
-          say(unit, fn() { "DPI" }, 16.0, weight=600, ink=ink_muted)
-        })
-      })
-      let _ = head.box(fn(st : view::View) -> Unit {
-        let _ = st.padding(view::Live::Is((0.0, 0.0, 0.0, 12.0)))
-        let _ = lg::liquid_stepper_node(
-          st,
-          fn() { m.dpi.get() },
-          fn(v : Int) -> Unit { set_dpi(v) },
-          min=dpi_least,
-          max=dpi_most,
-          step=dpi_step,
-          label=fn() { "DPI ±50" },
-          show_value=false,
-        )
-      })
-    })
-    // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`change`), the
-    // mouse is written once the hand lets go (`committed`).
-    let _ = lg::liquid_slider_node(
-      col,
-      fn() { m.dpi.get().to_double() },
-      fn(v : Double) -> Unit { m.dpi.set(v.to_int()) },
-      fn() { "DPI" },
-      least=dpi_least.to_double(),
-      most=dpi_most.to_double(),
-      step=dpi_step.to_double(),
-      committed=fn(v : Double) -> Unit { (d.set_dpi)(v.to_int(), m.lod.get()) },
-    )
-    // The scale under the slider.
-    let _ = col.box(fn(scale : view::View) -> Unit {
-      let _ = scale.row(view::Live::Is(true)).lies_along(view::Live::Is(view::Lies::Between))
-      for s in ["200", "1000", "2000", "3000", "4000"] {
-        say(scale, fn() { s }, 11.0, weight=500, ink=ink_faint)
-      }
-    })
-    let _ = col.box(fn(gap : view::View) -> Unit { let _ = gap.height(view::Live::Is(Some(4.0))) })
-    heading(col, "常用档位")
-    let _ = col.box(fn(row : view::View) -> Unit {
-      let _ = row.row(view::Live::Is(true)).gap(view::Live::Is(8.0))
-      for p in presets {
-        let v = p
-        let _ = lg::liquid_chip_node(
-          row,
-          fn() { v.to_string() },
-          fn() { set_dpi(v) },
-          selected=fn() { m.dpi.get() == v },
-          toggleable=false,
-        )
-      }
-    })
-    let _ = col.box(fn(gap : view::View) -> Unit { let _ = gap.height(view::Live::Is(Some(4.0))) })
-    heading(col, "抬起距离（LOD）")
-    let _ = lg::liquid_segmented_node(
-      col,
-      fn() { ["低", "中", "高"] },
-      fn() {
-        let l = m.lod.get()
-        if l < 1 { 0 } else if l > 3 { 2 } else { l - 1 }
-      },
-      fn(i : Int) -> Unit {
-        if i + 1 != m.lod.get() {
-          (d.set_dpi)(m.dpi.get(), i + 1)
-        }
-      },
-      width=264.0,
-    )
-  })
+  <ui::Col in={parent} grow={1.0} gap={12.0}>
+    <lg::SurfaceCard pad={16.0} gap={10.0} label="DPI">
+      <ui::Row align={.End} rigid>
+        <ui::Row align={.End} gap={8.0} rigid>
+          <ui::Text size={56.0} weight={700} color_by=>{ink()} text_by=>{m.dpi.get().to_string()} />
+          <ui::Box pad_y={10.0}>
+            <ui::Text size={15.0} weight={600} color_by=>{ink_secondary()} text="DPI" />
+          </ui::Box>
+        </ui::Row>
+        <ui::Spacer />
+        <ui::Box pad_y={10.0}>
+          <lg::Stepper
+            value_by=>{m.dpi.get()}
+            on_change={fn(v : Int) -> Unit { set_dpi(v) }}
+            min={dpi_least}
+            max={dpi_most}
+            step={dpi_step}
+            label="DPI ±50"
+            show_value={false}
+          />
+        </ui::Box>
+      </ui::Row>
+      // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`on_change`),
+      // the mouse is written once the hand lets go (`on_commit`).
+      <lg::Slider
+        value_by=>{m.dpi.get().to_double()}
+        on_change={fn(v : Double) -> Unit { m.dpi.set(v.to_int()) }}
+        on_commit={fn(v : Double) -> Unit { ask(v.to_int(), m.lod.untracked()) }}
+        label="DPI"
+        min={dpi_least.to_double()}
+        max={dpi_most.to_double()}
+        step={dpi_step.to_double()}
+      />
+      <ui::Row along={.Between} rigid>
+        <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="200" />
+        <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="1000" />
+        <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="2000" />
+        <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="3000" />
+        <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="4000" />
+      </ui::Row>
+    </lg::SurfaceCard>
+    <lg::SurfaceCard pad={16.0} gap={12.0} label="档位">
+      <ui::Row align={.Middle} gap={12.0} rigid>
+        <ui::Box width={84.0}>
+          <ui::Text size={13.0} weight={600} color_by=>{ink_secondary()} text="常用档位" />
+        </ui::Box>
+        <ui::Row gap={8.0} rigid>
+          <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
+          <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
+          <lg::Chip label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
+          <lg::Chip label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
+          <lg::Chip label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
+        </ui::Row>
+      </ui::Row>
+      <ui::Row align={.Middle} gap={12.0} rigid>
+        <ui::Box width={84.0}>
+          <ui::Text size={13.0} weight={600} color_by=>{ink_secondary()} text="抬起距离" />
+        </ui::Box>
+        <lg::Segmented
+          labels={["低", "中", "高"]}
+          selected_by=>{
+            let l = m.lod.get()
+            if l < 1 { 0 } else if l > 3 { 2 } else { l - 1 }
+          }
+          on_select={fn(i : Int) -> Unit {
+            if i + 1 != m.lod.untracked() {
+              ask(m.dpi.untracked(), i + 1)
+            }
+          }}
+          width={216.0}
+        />
+      </ui::Row>
+    </lg::SurfaceCard>
+  </ui::Col>
 }
 
-/// The whole window.
-pub fn app(root : view::View, m : Mouse, d : Device, picture~ : String = "mouse.png") -> Unit {
-  wallpaper(root)
-  let _ = root.box(fn(page : view::View) -> Unit {
-    let _ = page.grow(view::Live::Is(1.0)).padding(view::Live::Is((20.0, 14.0, 20.0, 24.0))).gap(view::Live::Is(8.0))
-    top_bar(page, m, d)
-    let _ = page.box(fn(body : view::View) -> Unit {
-      let _ = body.row(view::Live::Is(true)).grow(view::Live::Is(1.0)).gap(view::Live::Is(28.0))
-      mouse_column(body, m, d, picture)
-      dpi_column(body, m, d)
-    })
-  })
+/// The whole window. `window_act`: the window's own buttons (1 minimize, 3 close: put away to the tray); `reads`: what
+/// the device side reads without being asked (as the mouse wakes, every 30 s).
+pub fn app(
+  root : view::View,
+  m : Mouse,
+  worker : ui::Worker[Cmd, Ev],
+  window_act~ : (Int) -> Unit = fn(_w : Int) -> Unit { () },
+  reads? : ui::EventQueue[Ev],
+  picture~ : String = "mouse.png",
+) -> Unit {
+  let asked_at : Array[Double] = [-100000.0]
+  worker.bind(fn(ev : Ev) -> Unit { take(m, asked_at, ev) })
+  // reads the device side does on its own (a thread that waits on them), taken as the worker's are
+  match reads {
+    Some(q) => {
+      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, asked_at, ev) }) })
+    }
+    None => ()
+  }
+  // shown at once; written by the worker (the newest asked), its read back taken once it has settled
+  let ask = fn(dpi : Int, lod : Int) -> Unit {
+    asked_at[0] = hostapi::now()
+    m.dpi.set(dpi)
+    m.lod.set(lod)
+    let _ = worker.send(Cmd::Set(dpi, lod))
+  }
+  <lg::PageShell
+    in={root}
+    title="PRO X2 SUPERSTRIKE"
+    subtitle_by=>{if m.connected.get() { "已连接" } else { "未连接" }}
+    moves_window
+    grouped
+    trailing={fn(tr : view::View) -> Unit { bar_islands(tr, m, worker, window_act) }}
+  >
+    <ui::Row pad_x={16.0} gap={12.0} align={.Start}>
+      <MouseCard m={m} worker={worker} picture={picture} />
+      <DpiCards m={m} ask={ask} />
+    </ui::Row>
+  </lg::PageShell>
 }
