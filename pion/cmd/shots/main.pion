@@ -19,9 +19,9 @@ fn shot(dir : String, picture : String, name : String, dark : Bool, connected : 
   let path = "\{dir}/\{name}.png"
   let tree = fn(root) { dpi_ui::app(root, m, worker, picture=picture) }
   let ok = if frame >= 0 {
-    film::picture(tree, path=path, w=780.0, h=376.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
+    film::picture(tree, path=path, w=780.0, h=360.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
   } else {
-    film::picture(tree, path=path, w=780.0, h=376.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
+    film::picture(tree, path=path, w=780.0, h=360.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
   }
   worker.close()
   film::say("dpi_shots: \{path} \{ok}")

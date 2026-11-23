@@ -92,63 +92,66 @@ fn bar_islands(tr : view::View, m : Mouse, worker : ui::Worker[Cmd, Ev], window_
   </lg::BarPillGroup>
 }
 
-/// The left card: the mouse, whether it is there, and starting with Windows.
-fn MouseCard(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], picture~ : String) -> Unit {
-  <lg::SurfaceCard in={parent} pad={16.0} gap={14.0} label="鼠标">
-    <ui::Col align={.Middle} gap={10.0} width={188.0} rigid>
-      <ui::Box width={112.0} height={168.0} alpha_by=>{if m.connected.get() { 1.0 } else { 0.45 }}>
-        <ui::Image src={picture} width={112.0} height={168.0} contain max_px={640} />
-      </ui::Box>
-      <ui::Text
-        size={12.5}
-        color_by=>{ink_secondary()}
-        text_by=>{if m.connected.get() { "LIGHTSPEED · HID++ 2.0" } else { "未连接 · 正在找接收器" }}
-      />
-    </ui::Col>
-    <ui::Row align={.Middle} gap={12.0} rigid>
-      <ui::Text size={14.0} weight={500} color_by=>{ink()} text="开机自启" />
-      <ui::Spacer />
-      <lg::Toggle
-        on_by=>{m.autostart.get()}
-        on_change={fn(on : Bool) -> Unit { let _ = worker.send(Cmd::Autostart(on)) }}
-        label="开机自启"
-      />
-    </ui::Row>
-    <ui::Text size={11.5} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
-  </lg::SurfaceCard>
+/// The left: the mouse itself and whether it is there, on the page (no card round it).
+fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String) -> Unit {
+  <ui::Col in={parent} align={.Middle} along={.Middle} gap={10.0} width={196.0} rigid>
+    <ui::Box width={120.0} height={180.0} alpha_by=>{if m.connected.get() { 1.0 } else { 0.45 }}>
+      <ui::Image src={picture} width={120.0} height={180.0} contain max_px={640} />
+    </ui::Box>
+    <ui::Text
+      size={12.5}
+      color_by=>{ink_secondary()}
+      text_by=>{if m.connected.get() { "LIGHTSPEED · HID++ 2.0" } else { "未连接 · 正在找接收器" }}
+    />
+  </ui::Col>
 }
 
-/// The right: the DPI read out large with its stepper and slider, then presets and lift-off distance.
-fn DpiCards(parent : view::View, m~ : Mouse, ask~ : (Int, Int) -> Unit) -> Unit {
+/// A row of the settings card: its name, then what sets it.
+fn SettingRow(parent : view::View, name~ : String, children~ : (view::View) -> Unit) -> Unit {
+  let _ = ui::Row(parent, align=.Middle, gap=12.0, height=52.0, pad_x=16.0, rigid=true, children=fn(r : view::View) -> Unit {
+    <ui::Box in={r} width={72.0}>
+      <ui::Text size={13.5} weight={500} color_by=>{ink()} text={name} />
+    </ui::Box>
+    let _ = ui::Row(r, grow=1.0, align=.Middle, gap=8.0, children~)
+  })
+}
+
+/// A hairline between the settings card's rows.
+fn Hairline(parent : view::View) -> Unit {
+  <ui::Box in={parent} height={0.5} bg_by=>{lg::surface().separator} rigid />
+}
+
+/// The right: the DPI read out large with its stepper and slider on the page, then one card of settings.
+fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ : (Int, Int) -> Unit) -> Unit {
   let set_dpi = fn(v : Int) -> Unit {
     if v != m.dpi.untracked() {
       ask(v, m.lod.untracked())
     }
   }
-  <ui::Col in={parent} grow={1.0} gap={12.0}>
-    <lg::SurfaceCard pad={16.0} gap={10.0} label="DPI">
-      <ui::Row align={.End} rigid>
-        <ui::Row align={.End} gap={8.0} rigid>
-          <ui::Text size={56.0} weight={700} color_by=>{ink()} text_by=>{m.dpi.get().to_string()} />
-          <ui::Box pad_y={10.0}>
-            <ui::Text size={15.0} weight={600} color_by=>{ink_secondary()} text="DPI" />
-          </ui::Box>
-        </ui::Row>
-        <ui::Spacer />
+  <ui::Col in={parent} grow={1.0} gap={10.0}>
+    <ui::Row align={.End} pad_x={4.0} rigid>
+      <ui::Row align={.End} gap={8.0} rigid>
+        <ui::Text size={56.0} weight={700} color_by=>{ink()} text_by=>{m.dpi.get().to_string()} />
         <ui::Box pad_y={10.0}>
-          <lg::Stepper
-            value_by=>{m.dpi.get()}
-            on_change={fn(v : Int) -> Unit { set_dpi(v) }}
-            min={dpi_least}
-            max={dpi_most}
-            step={dpi_step}
-            label="DPI ±50"
-            show_value={false}
-          />
+          <ui::Text size={15.0} weight={600} color_by=>{ink_secondary()} text="DPI" />
         </ui::Box>
       </ui::Row>
-      // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`on_change`),
-      // the mouse is written once the hand lets go (`on_commit`).
+      <ui::Spacer />
+      <ui::Box pad_y={10.0}>
+        <lg::Stepper
+          value_by=>{m.dpi.get()}
+          on_change={fn(v : Int) -> Unit { set_dpi(v) }}
+          min={dpi_least}
+          max={dpi_most}
+          step={dpi_step}
+          label="DPI ±50"
+          show_value={false}
+        />
+      </ui::Box>
+    </ui::Row>
+    // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`on_change`),
+    // the mouse is written once the hand lets go (`on_commit`).
+    <ui::Col gap={6.0} pad_x={4.0} rigid>
       <lg::Slider
         value_by=>{m.dpi.get().to_double()}
         on_change={fn(v : Double) -> Unit { m.dpi.set(v.to_int()) }}
@@ -165,24 +168,17 @@ fn DpiCards(parent : view::View, m~ : Mouse, ask~ : (Int, Int) -> Unit) -> Unit 
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="3000" />
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="4000" />
       </ui::Row>
-    </lg::SurfaceCard>
-    <lg::SurfaceCard pad={16.0} gap={12.0} label="档位">
-      <ui::Row align={.Middle} gap={12.0} rigid>
-        <ui::Box width={84.0}>
-          <ui::Text size={13.0} weight={600} color_by=>{ink_secondary()} text="常用档位" />
-        </ui::Box>
-        <ui::Row gap={8.0} rigid>
-          <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
-          <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
-          <lg::Chip label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
-          <lg::Chip label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
-          <lg::Chip label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
-        </ui::Row>
-      </ui::Row>
-      <ui::Row align={.Middle} gap={12.0} rigid>
-        <ui::Box width={84.0}>
-          <ui::Text size={13.0} weight={600} color_by=>{ink_secondary()} text="抬起距离" />
-        </ui::Box>
+    </ui::Col>
+    <lg::SurfaceCard pad={0.0} radius={lg::r_row + 16.0} label="设置">
+      <SettingRow name="常用档位">
+        <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
+        <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
+        <lg::Chip label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
+        <lg::Chip label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
+        <lg::Chip label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
+      </SettingRow>
+      <Hairline />
+      <SettingRow name="抬起距离">
         <lg::Segmented
           labels={["低", "中", "高"]}
           selected_by=>{
@@ -196,7 +192,17 @@ fn DpiCards(parent : view::View, m~ : Mouse, ask~ : (Int, Int) -> Unit) -> Unit 
           }}
           width={216.0}
         />
-      </ui::Row>
+      </SettingRow>
+      <Hairline />
+      <SettingRow name="开机自启">
+        <ui::Text size={12.0} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
+        <ui::Spacer />
+        <lg::Toggle
+          on_by=>{m.autostart.get()}
+          on_change={fn(on : Bool) -> Unit { let _ = worker.send(Cmd::Autostart(on)) }}
+          label="开机自启"
+        />
+      </SettingRow>
     </lg::SurfaceCard>
   </ui::Col>
 }
@@ -236,8 +242,8 @@ pub fn app(
     trailing={fn(tr : view::View) -> Unit { bar_islands(tr, m, worker, window_act) }}
   >
     <ui::Row pad_x={16.0} gap={12.0} align={.Start}>
-      <MouseCard m={m} worker={worker} picture={picture} />
-      <DpiCards m={m} ask={ask} />
+      <MouseSide m={m} picture={picture} />
+      <DpiSide m={m} worker={worker} ask={ask} />
     </ui::Row>
   </lg::PageShell>
 }

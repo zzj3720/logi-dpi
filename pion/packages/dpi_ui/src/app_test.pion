@@ -11,7 +11,7 @@ fn window(m : Mouse, worker : ui::Worker[Cmd, Ev], acts : Array[Int]) -> ui::Tes
       app(root, m, worker, window_act=fn(w : Int) -> Unit { acts.push(w) }, picture="")
     },
     width=780.0,
-    height=376.0,
+    height=360.0,
     theme=lg::ui_theme,
   )
 }

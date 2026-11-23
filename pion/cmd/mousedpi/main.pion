@@ -61,8 +61,8 @@ let tray_menu : String = "[{\"role\":\"tray\",\"items\":[{\"title\":\"打开 Mou
 
 fn main(world : World) -> Int {
   host::install()
-  // 780 × 376 points (what the page holds), no smaller than 640 × 360, the page the whole window (no title bar of the system's)
-  hostapi::window_setup(640.0, 360.0, 780.0, 376.0, true)
+  // 780 × 360 points (what the page holds), no smaller than 640 × 340, the page the whole window (no title bar of the system's)
+  hostapi::window_setup(640.0, 340.0, 780.0, 360.0, true)
   hostapi::window_center()
   if c_started_hidden() != 0 {
     // started with Windows: in the tray till it is brought back
