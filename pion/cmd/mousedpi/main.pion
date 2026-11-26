@@ -23,6 +23,8 @@ extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
 
 extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
 
+extern "C" fn c_request_set_seq(seq : Int, dpi : Int, lod : Int) -> Unit = "mousedpi_request_set_seq"
+
 extern "C" fn c_request_wake_restore() -> Unit = "mousedpi_request_wake_restore"
 
 extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
@@ -32,6 +34,10 @@ extern "C" fn c_wait_rev(seen : Int) -> Int = "mousedpi_wait_rev"
 extern "C" fn c_stop_waits() -> Unit = "mousedpi_stop_waits"
 
 extern "C" fn c_snapshot_capture() -> Unit = "mousedpi_snapshot_capture"
+
+extern "C" fn c_snap_rev() -> Int = "mousedpi_snap_rev"
+
+extern "C" fn c_snap_applied_seq() -> Int = "mousedpi_snap_applied_seq"
 
 extern "C" fn c_snap_connected() -> Int = "mousedpi_snap_connected"
 
@@ -49,6 +55,8 @@ extern "C" fn c_picture_path_dup() -> Ptr = "mousedpi_picture_path_dup"
 
 extern "C" fn c_can_hide_to_tray() -> Int = "mousedpi_can_hide_to_tray"
 
+extern "C" fn c_wait_tray_ready(timeout_ms : Int) -> Int = "mousedpi_wait_tray_ready"
+
 extern "C" fn c_autostart() -> Int = "mousedpi_get_autostart"
 
 extern "C" fn c_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
@@ -63,17 +71,19 @@ fn take_c_str(p : Ptr) -> String {
   }
 }
 
-/// Capture an atomic snapshot of the C side's state and turn it into a `dpi_ui::Ev::Read`.
-fn read_snapshot() -> dpi_ui::Ev {
+/// Capture an atomic snapshot of the C side's state and return `(Ev::Read, snap_rev)`.
+fn read_snapshot() -> (dpi_ui::Ev, Int) {
   c_snapshot_capture()
-  dpi_ui::Ev::Read(
+  let ev = dpi_ui::Ev::Read(
     c_snap_connected() != 0,
     c_snap_dpi_x(),
     c_snap_lod(),
     c_snap_battery(),
     c_snap_perm_denied() != 0,
     take_c_str(c_snap_device_name_dup()),
+    c_snap_applied_seq(),
   )
+  (ev, c_snap_rev())
 }
 
 /// What the window asks, on the worker's thread (none of it blocks: the C side's refresher thread does the HID++).
@@ -81,7 +91,7 @@ fn handle(cmd : dpi_ui::Cmd, emit : (dpi_ui::Ev) -> Unit) -> Unit {
   match cmd {
     dpi_ui::Cmd::Refresh => c_request_refresh()
     dpi_ui::Cmd::WakeRestore => c_request_wake_restore()
-    dpi_ui::Cmd::Set(dpi, lod) => c_request_set(dpi, lod)
+    dpi_ui::Cmd::Set(seq, dpi, lod) => c_request_set_seq(seq, dpi, lod)
     dpi_ui::Cmd::Autostart(on) => emit(dpi_ui::Ev::Autostarts(c_set_autostart(if on { 1 } else { 0 }) != 0))
   }
 }
@@ -97,26 +107,33 @@ fn main(world : World) -> Int {
   let plat = hostapi::platform()
   let is_macos = plat == 0
   let is_windows = plat == 3
+  let is_linux = plat == 5
   // 780 × 360 points, no smaller than 640 × 340, inset title bar on all three desktop platforms.
   hostapi::window_setup(640.0, 340.0, 780.0, 360.0, inset=true)
-  if is_macos {
-    // Align macOS traffic lights vertically with the 44pt top bar (padding top 10 -> y=32).
-    // Do NOT register set_window_close on macOS: let mac_app.m handle native hide/reopen & Shown.
-    hostapi::window_buttons_down(10.0, 0.0)
-  }
   hostapi::window_center()
-  let hidden = c_started_hidden() != 0 && c_can_hide_to_tray() != 0
+  let want_tray = c_started_hidden() != 0
+  let can_tray = c_can_hide_to_tray() != 0
+  let linux_wait_tray = is_linux && want_tray
+  let hidden = !is_linux && want_tray && can_tray
   if hidden {
-    // Started in tray mode (e.g. login autostart) when a tray host is available.
+    // Started in tray mode (e.g. login autostart) on macOS/Windows when a tray host is available.
     hostapi::window_hide()
   } else {
     // Keep out of sight until its first frame is drawn, centered, then shown (no jump, no blank flash).
+    // On Linux with --tray, stay held until SNI tray registration is confirmed online.
     hostapi::window_hold()
   }
   hostapi::menu_setup(if is_macos { macos_menu } else { tray_menu })
   let pic_raw = take_c_str(c_picture_path_dup())
   let picture = if pic_raw != "" { pic_raw } else { "mouse.png" }
-  let close_label = if is_windows { "关闭到托盘" } else { "关闭" }
+  let close_label = if is_windows || can_tray { "关闭到托盘" } else { "关闭" }
+  let perm_hint = if is_macos {
+    "请在 系统设置 → 隐私与安全性 → 输入监控 中授权"
+  } else if is_windows {
+    "请检查 HID 设备访问权限后重试"
+  } else {
+    "请安装 udev 规则后重新插拔接收器"
+  }
   // Seed initial state from config.ini until the receiver answers so startup never flashes "未连接".
   let m = dpi_ui::Mouse::new()
   m.connected.set(true)
@@ -125,6 +142,7 @@ fn main(world : World) -> Int {
   m.autostart.set(c_autostart() != 0)
   let (worker, ctx) : (ui::Worker[dpi_ui::Cmd, dpi_ui::Ev], ui::WorkerCtx[dpi_ui::Cmd, dpi_ui::Ev]) = ui::Worker::pair()
   let reads : ui::EventQueue[dpi_ui::Ev] = ui::EventQueue::new()
+  let tray_decisions : ui::EventQueue[Bool] = ui::EventQueue::new()
   // Register system lifecycle listener before ui::run so Shown/wake events are never missed.
   ui::on_message(hostapi::system_channel, fn(json : String, _bytes : Option[Bytes]) -> Unit {
     for said in hostapi::system_said(json) {
@@ -144,15 +162,25 @@ fn main(world : World) -> Int {
   })
   scope(world, fn(s : Scope) -> Unit {
     spawn(s, fn() -> Unit { ctx.run_loop(handle) })
+    if linux_wait_tray {
+      spawn(s, fn() -> Unit {
+        tray_decisions.emit(c_wait_tray_ready(1500) != 0)
+      })
+    }
     // The watcher: initialize/restore saved DPI, emit initial atomic snapshot, then relay every revision update.
     spawn(s, fn() -> Unit {
       let _ = c_init_and_restore()
-      reads.emit(read_snapshot())
-      let mut seen = c_state_rev()
+      let (ev0, rev0) = read_snapshot()
+      reads.emit(ev0)
+      let mut seen = rev0
       while seen >= 0 {
-        seen = c_wait_rev(seen)
-        if seen >= 0 {
-          reads.emit(read_snapshot())
+        let next_rev = c_wait_rev(seen)
+        if next_rev < 0 {
+          seen = next_rev
+        } else {
+          let (ev, rev) = read_snapshot()
+          reads.emit(ev)
+          seen = rev
         }
       }
     })
@@ -169,9 +197,26 @@ fn main(world : World) -> Int {
           show_window_controls=!is_macos,
           macos_inset=is_macos,
           close_label=close_label,
+          perm_hint=perm_hint,
         )
+        if is_macos {
+          // Align macOS traffic lights vertically with the 44pt top bar (padding top 10 -> y=32).
+          // Called after the first window slot exists and before window_show().
+          // Do NOT register set_window_close on macOS: let mac_app.m handle native hide/reopen & Shown.
+          hostapi::window_buttons_down(10.0, 0.0)
+        }
         // Shown once its first frame is drawn, unless started hidden in the tray.
-        if !hidden {
+        if linux_wait_tray {
+          let _ = ui::on_before_frame(fn() {
+            let _ = tray_decisions.drain(fn(ready : Bool) -> Unit {
+              if ready {
+                hostapi::window_hide()
+              } else {
+                hostapi::window_show()
+              }
+            })
+          })
+        } else if !hidden {
           hostapi::window_show()
         }
       },

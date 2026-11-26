@@ -4,7 +4,6 @@
 // (inset on all three platforms). What the window shows comes from `Mouse` (signals the worker's events write);
 // what it asks goes to the worker (`Cmd`).
 
-import "hostapi"
 import "lg"
 import "signals"
 import "ui"
@@ -40,10 +39,6 @@ pub let dpi_most : Int = 4000
 
 pub let dpi_step : Int = 50
 
-/// How long after the window asks for a DPI/LOD a read is not taken for them (hostapi::now ms): a read the device side
-/// did before the write landed is older than what is shown.
-let settle_ms : Double = 1500.0
-
 fn ink() -> Int64 {
   lg::surface().ink
 }
@@ -56,17 +51,17 @@ fn ink_tertiary() -> Int64 {
   lg::surface().ink_tertiary
 }
 
-/// The worker's events into `m` (bound before every frame; `asked_at[0]` is when the window last asked for a DPI/LOD).
-fn take(m : Mouse, asked_at : Array[Double], ev : Ev) -> Unit {
+/// The worker's events into `m` (bound before every frame; `pending_seq[0]` is the latest requested write sequence).
+fn take(m : Mouse, pending_seq : Array[Int], ev : Ev) -> Unit {
   match ev {
-    Ev::Read(ok, dpi, lod, battery, perm_denied, device_name) => {
+    Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq) => {
       m.connected.set(ok)
       m.perm_denied.set(perm_denied)
       if device_name != "" {
         m.device_name.set(device_name)
       }
       if ok {
-        if hostapi::now() - asked_at[0] > settle_ms {
+        if applied_seq >= pending_seq[0] {
           m.dpi.set(dpi)
           m.lod.set(lod)
         }
@@ -110,7 +105,7 @@ fn bar_islands(
 }
 
 /// The left: the mouse itself and connection/permission state, on the page (no card round it).
-fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String) -> Unit {
+fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String, perm_hint~ : String) -> Unit {
   <ui::Col in={parent} align={.Middle} along={.Middle} gap={10.0} width={196.0} rigid>
     <ui::Box width={120.0} height={180.0} alpha_by=>{if m.connected.get() { 1.0 } else { 0.45 }}>
       <ui::Image src={picture} width={120.0} height={180.0} contain max_px={640} />
@@ -123,9 +118,9 @@ fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String) -> Unit {
         color_by=>{ink_secondary()}
         text_by=>{
           if m.perm_denied.get() {
-            "请安装 udev 规则或在系统设置中授予权限"
+            perm_hint
           } else if m.connected.get() {
-            "LIGHTSPEED HID++ 2.0"
+            "Logitech HID++ 2.0"
           } else {
             "未连接，正在查找接收器"
           }
@@ -182,7 +177,11 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
     // the mouse is written once the hand lets go (`on_commit`).
     <ui::Col gap={6.0} pad_x={4.0} rigid>
       <lg::Slider
-        value_by=>{m.dpi.get().to_double()}
+        value_by=>{
+          let v = m.dpi.get()
+          let clamped = if v < dpi_least { dpi_least } else if v > dpi_most { dpi_most } else { v }
+          clamped.to_double()
+        }
         on_change={fn(v : Double) -> Unit { m.dpi.set(v.to_int()) }}
         on_commit={fn(v : Double) -> Unit { ask(v.to_int(), m.lod.untracked()) }}
         label="DPI"
@@ -243,7 +242,8 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
 /// - `reads`: what the device side reads without being asked (as the mouse wakes, every 30 s).
 /// - `show_window_controls`: true on Windows/Linux (custom minimize/close buttons), false on macOS (native traffic lights).
 /// - `macos_inset`: true on macOS to reserve a reactive 68pt leading spacer while traffic lights are inset.
-/// - `close_label`: accessible label for the close button ("关闭到托盘" on Windows, "关闭" on Linux).
+/// - `close_label`: accessible label for the close button ("关闭到托盘" when tray is available, else "关闭").
+/// - `perm_hint`: platform-specific guidance shown when HID permission is denied.
 pub fn app(
   root : view::View,
   m : Mouse,
@@ -254,22 +254,25 @@ pub fn app(
   show_window_controls~ : Bool = true,
   macos_inset~ : Bool = false,
   close_label~ : String = "关闭到托盘",
+  perm_hint~ : String = "请安装 udev 规则或在系统设置中授予权限",
 ) -> Unit {
-  let asked_at : Array[Double] = [-100000.0]
-  worker.bind(fn(ev : Ev) -> Unit { take(m, asked_at, ev) })
+  let pending_seq : Array[Int] = [0]
+  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, ev) })
   // reads the device side does on its own (a thread that waits on them), taken as the worker's are
   match reads {
     Some(q) => {
-      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, asked_at, ev) }) })
+      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, ev) }) })
     }
     None => ()
   }
-  // shown at once; written by the worker (the newest asked), its read back taken once it has settled
+  // shown at once; written by the worker with a monotonic sequence number so stale reads are ignored
+  // while the real device readback (including rejections or clamping) is applied immediately.
   let ask = fn(dpi : Int, lod : Int) -> Unit {
-    asked_at[0] = hostapi::now()
+    let seq = pending_seq[0] + 1
+    pending_seq[0] = seq
     m.dpi.set(dpi)
     m.lod.set(lod)
-    let _ = worker.send(Cmd::Set(dpi, lod))
+    let _ = worker.send(Cmd::Set(seq, dpi, lod))
   }
   <lg::PageShell
     in={root}
@@ -295,7 +298,7 @@ pub fn app(
     }}
   >
     <ui::Row pad_x={16.0} gap={12.0} align={.Start}>
-      <MouseSide m={m} picture={picture} />
+      <MouseSide m={m} picture={picture} perm_hint={perm_hint} />
       <DpiSide m={m} worker={worker} ask={ask} />
     </ui::Row>
   </lg::PageShell>

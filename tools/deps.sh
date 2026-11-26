@@ -12,6 +12,13 @@ if [ -L "$DIR" ]; then
     echo "deps: broken symlink at $DIR" >&2
     exit 1
   fi
+  if git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    CUR_FULL="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [ "$CUR_FULL" != "$REV" ] && [ "${INVAR_ALLOW_ANY_REV:-0}" != "1" ]; then
+      echo "deps: symlinked deps/invar is at ${CUR_FULL:-unknown}, expected $REV (set INVAR_ALLOW_ANY_REV=1 to override)" >&2
+      exit 1
+    fi
+  fi
   CUR="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo external)"
   echo "deps: using symlinked deps/invar at $CUR"
 elif [ -d "$DIR/.git" ] || [ -f "$DIR/.git" ]; then

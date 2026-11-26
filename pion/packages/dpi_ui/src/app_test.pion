@@ -15,20 +15,39 @@ fn window(
   show_window_controls~ : Bool = true,
   macos_inset~ : Bool = false,
   close_label~ : String = "关闭到托盘",
+  perm_hint~ : String = "请安装 udev 规则或在系统设置中授予权限",
+  reads? : ui::EventQueue[Ev],
   platform~ : Int = 3,
 ) -> ui::Tester {
   ui::Tester::tree(
     fn(root : view::View) -> Unit {
-      app(
-        root,
-        m,
-        worker,
-        window_act=fn(w : Int) -> Unit { acts.push(w) },
-        picture="",
-        show_window_controls=show_window_controls,
-        macos_inset=macos_inset,
-        close_label=close_label,
-      )
+      match reads {
+        Some(q) =>
+          app(
+            root,
+            m,
+            worker,
+            window_act=fn(w : Int) -> Unit { acts.push(w) },
+            reads=q,
+            picture="",
+            show_window_controls=show_window_controls,
+            macos_inset=macos_inset,
+            close_label=close_label,
+            perm_hint=perm_hint,
+          )
+        None =>
+          app(
+            root,
+            m,
+            worker,
+            window_act=fn(w : Int) -> Unit { acts.push(w) },
+            picture="",
+            show_window_controls=show_window_controls,
+            macos_inset=macos_inset,
+            close_label=close_label,
+            perm_hint=perm_hint,
+          )
+      }
     },
     width=width,
     height=height,
@@ -232,5 +251,118 @@ test "the controls ask the worker, and its reads come back into the window" {
   assert_clean_ui(t, "dpi_after_controls")
   worker.close()
   t.dispose()
+  lg::set_dark(None)
+}
+
+test "sequence readback ignores stale reads, snaps back on device rejection, and clamps slider above max" {
+  lg::set_dark(Some(true))
+  let m = Mouse::new()
+  m.connected.set(true)
+  m.dpi.set(800)
+  m.lod.set(3)
+  let sets : Array[(Int, Int, Int)] = []
+  let worker = ui::Worker::inline(fn(cmd : Cmd, _emit : (Ev) -> Unit) -> Unit {
+    match cmd {
+      Cmd::Set(seq, d, l) => sets.push((seq, d, l))
+      _ => ()
+    }
+  })
+  let reads : ui::EventQueue[Ev] = ui::EventQueue::new()
+  let t = window(m, worker, [], reads=reads)
+  t.frame()
+
+  // UI initiates Set(seq=1, 1600, 3) optimistically.
+  t.press("1600")
+  t.frame(ms=16.0)
+  debug_assert(sets.length() == 1, "expected 1 Set command, got \{sets.length()}")
+  let (s_seq, s_dpi, s_lod) = sets[0]
+  debug_assert(s_seq == 1 && s_dpi == 1600 && s_lod == 3, "expected Set(1, 1600, 3), got (\{s_seq}, \{s_dpi}, \{s_lod})")
+  debug_assert(m.dpi.untracked() == 1600 && m.lod.untracked() == 3, "optimistic update applied")
+
+  // Stale concurrent read (applied_seq=0 < pending_seq=1): DPI/LOD must be ignored, battery still updates.
+  reads.emit(Ev::Read(true, 800, 2, 72, false, "PRO X2 SUPERSTRIKE", 0))
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 1600, "stale read must not overwrite DPI, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 3, "stale read must not overwrite LOD, got \{m.lod.untracked()}")
+  debug_assert(m.battery.untracked() == 72, "stale read still updates battery, got \{m.battery.untracked()}")
+
+  // Device rejection readback (applied_seq=1 >= pending_seq=1): must immediately snap back to real 800/2.
+  reads.emit(Ev::Read(true, 800, 2, 72, false, "PRO X2 SUPERSTRIKE", 1))
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 800, "rejected write must immediately snap DPI back to 800, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 2, "rejected write must immediately snap LOD back to 2, got \{m.lod.untracked()}")
+
+  // Out-of-slider-range DPI from external software (>4000): slider clamps safely while readout shows real value.
+  reads.emit(Ev::Read(true, 6400, 2, 72, false, "PRO X2 SUPERSTRIKE", 1))
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 6400, "real DPI 6400 preserved")
+  debug_assert(t.find("6400").is_some(), "real DPI 6400 displayed")
+  assert_clean_ui(t, "seq_reject_and_clamp")
+
+  worker.close()
+  t.dispose()
+  lg::set_dark(None)
+}
+
+test "macos 640x340 minimum size with 63-byte device name and low-battery or perm-denied passes gates" {
+  let long_name = "Logitech G PRO X2 SUPERSTRIKE LIGHTSPEED WIRELESS GAMING MOUSE!"
+  debug_assert(long_name.length() == 63, "test device name should be 63 bytes, got \{long_name.length()}")
+  for dark in [false, true] {
+    lg::set_dark(Some(dark))
+
+    // Low battery at 640x340 macOS inset chrome
+    let m_low = Mouse::new()
+    m_low.connected.set(true)
+    m_low.dpi.set(1600)
+    m_low.battery.set(15)
+    m_low.device_name.set(long_name)
+    let w_low = ui::Worker::inline(stand_in(15, device_name=long_name))
+    let t_low = window(
+      m_low,
+      w_low,
+      [],
+      width=640.0,
+      height=340.0,
+      show_window_controls=false,
+      macos_inset=true,
+      platform=0,
+    )
+    t_low.fake.window_inset_flag = true
+    t_low.fake.frame_requested = true
+    t_low.frame()
+    debug_assert(t_low.find("电量 15%").is_some(), "low battery badge shown at 640x340 macOS")
+    assert_clean_ui(t_low, "macos_640x340_63b_low_dark_\{dark}")
+    w_low.close()
+    t_low.dispose()
+
+    // Permission denied at 640x340 macOS inset chrome with macOS-specific hint
+    let mac_hint = "请在 系统设置 → 隐私与安全性 → 输入监控 中授权"
+    let m_perm = Mouse::new()
+    m_perm.connected.set(false)
+    m_perm.perm_denied.set(true)
+    m_perm.dpi.set(800)
+    m_perm.battery.set(-1)
+    m_perm.device_name.set(long_name)
+    let w_perm = ui::Worker::inline(stand_in(-1, device_name=long_name, perm_denied=true))
+    let t_perm = window(
+      m_perm,
+      w_perm,
+      [],
+      width=640.0,
+      height=340.0,
+      show_window_controls=false,
+      macos_inset=true,
+      perm_hint=mac_hint,
+      platform=0,
+    )
+    t_perm.fake.window_inset_flag = true
+    t_perm.fake.frame_requested = true
+    t_perm.frame()
+    debug_assert(t_perm.find("需要 HID 权限").is_some(), "perm denied subtitle shown at 640x340 macOS")
+    debug_assert(t_perm.find(mac_hint).is_some(), "macos perm_hint shown")
+    assert_clean_ui(t_perm, "macos_640x340_63b_perm_dark_\{dark}")
+    w_perm.close()
+    t_perm.dispose()
+  }
   lg::set_dark(None)
 }
