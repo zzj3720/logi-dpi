@@ -17,15 +17,17 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$OUT/MouseDPI" "$APP/Contents/MacOS/MouseDPI"
 cp "$ROOT/assets/mouse.png" "$APP/Contents/Resources/mouse.png"
 
-# Best-effort .icns generation from assets/mouse.png when macOS sips + iconutil are available.
+# Best-effort square-padded .icns generation from assets/mouse.png when macOS sips + iconutil are available.
 if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
   ICONSET="$OUT/AppIcon.iconset"
   rm -rf "$ICONSET"
   mkdir -p "$ICONSET"
   for sz in 16 32 128 256 512; do
     sz2=$((sz * 2))
-    sips -z "$sz" "$sz" "$ROOT/assets/mouse.png" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
-    sips -z "$sz2" "$sz2" "$ROOT/assets/mouse.png" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
+    sips -Z "$sz" "$ROOT/assets/mouse.png" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
+    sips -p "$sz" "$sz" "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
+    sips -Z "$sz2" "$ROOT/assets/mouse.png" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
+    sips -p "$sz2" "$sz2" "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
   done
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" >/dev/null 2>&1 || true
   rm -rf "$ICONSET"

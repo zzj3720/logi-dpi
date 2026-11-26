@@ -227,6 +227,14 @@ static void device_matched_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
 
     IOHIDDeviceRegisterInputReportCallback(
         device, slot->cb_buf, (CFIndex)slot->cb_buf_len, input_report_cb, slot);
+
+    /* Hotplug after initial manager startup: trigger wake restore / refresh. */
+    pthread_mutex_lock(&g_mgr_lock);
+    int ready = g_mgr_ready;
+    pthread_mutex_unlock(&g_mgr_lock);
+    if (ready) {
+        hidpp_core_signal_wake();
+    }
 }
 
 static void destroy_slot(macos_slot_t *slot) {
@@ -277,7 +285,10 @@ static void *hid_mgr_thread_main(void *unused) {
     @autoreleasepool {
         IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
         if (mgr) {
-            NSDictionary *match = @{ @(kIOHIDVendorIDKey): @(HIDPP_VID_LOGITECH) };
+            NSDictionary *match = @{
+                @(kIOHIDVendorIDKey): @(HIDPP_VID_LOGITECH),
+                @(kIOHIDDeviceUsagePageKey): @(HIDPP_USAGE_PAGE_VENDOR),
+            };
             IOHIDManagerSetDeviceMatching(mgr, (__bridge CFDictionaryRef)match);
             IOHIDManagerRegisterDeviceMatchingCallback(mgr, device_matched_cb, NULL);
             IOHIDManagerRegisterDeviceRemovalCallback(mgr, device_removed_cb, NULL);

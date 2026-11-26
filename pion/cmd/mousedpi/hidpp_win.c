@@ -197,7 +197,7 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
     return count;
 }
 
-static HANDLE open_notify_short_handle(USHORT want_in_len, USHORT *out_in_len) {
+static HANDLE open_notify_short_handle(uint16_t want_pid, USHORT want_in_len, USHORT *out_in_len) {
     GUID hid_guid;
     HidD_GetHidGuid(&hid_guid);
     HDEVINFO info = SetupDiGetClassDevsA(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -216,8 +216,9 @@ static HANDLE open_notify_short_handle(USHORT want_in_len, USHORT *out_in_len) {
         if (!det) continue;
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
         if (SetupDiGetDeviceInterfaceDetailA(info, &did, det, req, NULL, NULL)) {
-            uint16_t vid = 0;
-            if (parse_hex4_after(det->DevicePath, "vid_", &vid) && vid == HIDPP_VID_LOGITECH) {
+            uint16_t vid = 0, pid = 0;
+            if (parse_hex4_after(det->DevicePath, "vid_", &vid) && vid == HIDPP_VID_LOGITECH &&
+                (want_pid == 0 || (parse_hex4_after(det->DevicePath, "pid_", &pid) && pid == want_pid))) {
                 HANDLE h = CreateFileA(
                     det->DevicePath,
                     GENERIC_READ,
@@ -259,8 +260,12 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     USHORT out_len = HIDPP_LONG_LEN;
 
     if (notify_only) {
-        /* Prefer the 7-byte short HID++ TLC on Windows where 0x41 wake notifications arrive. */
-        h = open_notify_short_handle(HIDPP_SHORT_LEN, &in_len);
+        /* Prefer the 7-byte short HID++ TLC on the SAME PID where 0x41 wake notifications arrive. */
+        uint16_t want_pid = 0;
+        if (endpoint_id && endpoint_id[0]) {
+            (void)parse_hex4_after(endpoint_id, "pid_", &want_pid);
+        }
+        h = open_notify_short_handle(want_pid, HIDPP_SHORT_LEN, &in_len);
         if (h == INVALID_HANDLE_VALUE && endpoint_id && endpoint_id[0]) {
             h = CreateFileA(
                 endpoint_id,

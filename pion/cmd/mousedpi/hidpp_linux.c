@@ -279,7 +279,9 @@ static int probe_hidraw_rdesc(const char *dev_path, int *out_perm_denied) {
         if (ioctl(fd, HIDIOCGRDESC, &rdesc) >= 0) {
             hidpp_rdesc_caps_t caps;
             hidpp_parse_report_descriptor(rdesc.value, rdesc.size, &caps);
-            if (caps.has_ff00 && caps.out_bytes_11 == HIDPP_LONG_LEN) {
+            if (caps.has_ff00 &&
+                caps.out_bytes_11 == HIDPP_LONG_LEN &&
+                caps.in_bytes_11 >= HIDPP_LONG_LEN) {
                 match = 1;
             }
         }

@@ -1,12 +1,15 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <assert.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
 #include <time.h>
 #include <unistd.h>
+#endif
 
 /* Include the production core directly so we can test with a mock platform layer. */
 #include "hidpp_core.c"
@@ -58,7 +61,8 @@ struct hidpp_dev {
     int            rx_count;
 };
 
-static pthread_mutex_t g_mock_lock = PTHREAD_MUTEX_INITIALIZER;
+static hidpp_mutex_t   g_mock_lock;
+static int             g_mock_lock_inited = 0;
 static mock_device_t   g_mock_devs[8];
 static int             g_mock_dev_count = 0;
 static int             g_mock_enum_perm_denied = 0;
@@ -69,9 +73,21 @@ static int             g_mock_cfg_writes = 0;
 static uint64_t        g_mock_idle_ms = UINT64_MAX;
 static int32_t         g_mock_autostart = 0;
 
+static void mock_lock(void) {
+    if (!g_mock_lock_inited) {
+        hidpp_mutex_init(&g_mock_lock);
+        g_mock_lock_inited = 1;
+    }
+    hidpp_mutex_lock(&g_mock_lock);
+}
+
+static void mock_unlock(void) {
+    hidpp_mutex_unlock(&g_mock_lock);
+}
+
 static void mock_reset(void) {
     hidpp_core_test_reset();
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     memset(g_mock_devs, 0, sizeof(g_mock_devs));
     g_mock_dev_count = 0;
     g_mock_enum_perm_denied = 0;
@@ -81,7 +97,7 @@ static void mock_reset(void) {
     g_mock_cfg_writes = 0;
     g_mock_idle_ms = UINT64_MAX;
     g_mock_autostart = 0;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
 }
 
 static void dev_push_rx(hidpp_dev_t *d, const uint8_t *buf, int len) {
@@ -102,22 +118,30 @@ void hidpp_plat_stop_watchers(void) {}
 int  hidpp_plat_needs_notify_thread(void) { return 0; }
 
 uint64_t hidpp_plat_now_ms(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+#endif
 }
 
 void hidpp_plat_sleep_ms(uint32_t ms) {
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
     struct timespec ts;
     ts.tv_sec = (time_t)(ms / 1000u);
     ts.tv_nsec = (long)((ms % 1000u) * 1000000u);
     nanosleep(&ts, NULL);
+#endif
 }
 
 uint64_t hidpp_plat_mouse_idle_ms(void) {
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     uint64_t v = g_mock_idle_ms;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return v;
 }
 
@@ -136,28 +160,28 @@ char *hidpp_plat_picture_path_dup(void) {
 }
 
 int hidpp_plat_config_read(int32_t *out_dpi, int32_t *out_lod) {
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     int has = g_mock_cfg_has;
     if (has) {
         if (out_dpi) *out_dpi = g_mock_cfg_dpi;
         if (out_lod) *out_lod = g_mock_cfg_lod;
     }
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return has;
 }
 
 int hidpp_plat_config_write(int32_t dpi, int32_t lod) {
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     g_mock_cfg_has = 1;
     g_mock_cfg_dpi = dpi;
     g_mock_cfg_lod = lod;
     g_mock_cfg_writes++;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return 1;
 }
 
 int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_perm_denied) {
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     if (out_perm_denied) *out_perm_denied = g_mock_enum_perm_denied;
     int n = 0;
     for (int i = 0; i < g_mock_dev_count && n < max_count; i++) {
@@ -168,19 +192,19 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
         ep->pid = g_mock_devs[i].pid;
         ep->kind = g_mock_devs[i].kind;
     }
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return n;
 }
 
 hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_perm_denied) {
     if (out_perm_denied) *out_perm_denied = 0;
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     mock_device_t *found = NULL;
     for (int i = 0; i < g_mock_dev_count; i++) {
         if (strcmp(g_mock_devs[i].id, endpoint_id) == 0) {
             if (g_mock_devs[i].perm_denied) {
                 if (out_perm_denied) *out_perm_denied = 1;
-                pthread_mutex_unlock(&g_mock_lock);
+                mock_unlock();
                 return NULL;
             }
             found = &g_mock_devs[i];
@@ -188,7 +212,7 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
         }
     }
     if (!found) {
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return NULL;
     }
     hidpp_dev_t *d = (hidpp_dev_t *)calloc(1, sizeof(*d));
@@ -198,7 +222,7 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     for (int i = 0; i < found->stale_count; i++) {
         dev_push_rx(d, found->stale[i].data, found->stale[i].len);
     }
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return d;
 }
 
@@ -208,28 +232,28 @@ void hidpp_plat_close(hidpp_dev_t *dev) {
 
 void hidpp_plat_drain(hidpp_dev_t *dev) {
     if (!dev) return;
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     dev->m->drain_calls++;
     dev->rx_head = 0;
     dev->rx_tail = 0;
     dev->rx_count = 0;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
 }
 
 int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
     if (!dev || !buf || len == 0) return -1;
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     mock_device_t *m = dev->m;
 
     /* HID++ 1.0 wireless notification register 0x00 enable */
     if (len == HIDPP_SHORT_LEN && buf[0] == 0x10 && buf[1] == 0xFF && buf[2] == 0x80 && buf[3] == 0x00) {
         m->notif_reg_writes++;
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return (int)len;
     }
 
     if (len < HIDPP_LONG_LEN || buf[0] != 0x11) {
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return -1;
     }
 
@@ -240,7 +264,7 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
 
     if (m->noise_forever) {
         /* Never enqueue a matching response */
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return (int)len;
     }
 
@@ -252,7 +276,7 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
     if (m->offline_10_8f) {
         uint8_t err[7] = { 0x10, dev_idx, 0x8F, feat_idx, fn_sw, 0x08, 0x00 };
         dev_push_rx(dev, err, 7);
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return (int)len;
     }
 
@@ -265,7 +289,7 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         err[4] = fn_sw;
         err[5] = 0x02; /* Invalid argument */
         dev_push_rx(dev, err, 20);
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return (int)len;
     }
 
@@ -273,7 +297,7 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         /* Offline / unsupported slot responds with HID++ 1.0 0x8F error */
         uint8_t err[7] = { 0x10, dev_idx, 0x8F, feat_idx, fn_sw, 0x08, 0x00 };
         dev_push_rx(dev, err, 7);
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         return (int)len;
     }
 
@@ -345,15 +369,15 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         dev_push_rx(dev, r, 20);
     }
 
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
     return (int)len;
 }
 
 int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) {
     if (!dev || !buf || cap == 0) return -1;
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     if (dev->m->noise_forever) {
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         /* Return an unrelated 0x41 notification after 20ms to test single deadline */
         int sleep_for = timeout_ms < 20 ? timeout_ms : 20;
         if (sleep_for > 0) hidpp_plat_sleep_ms((uint32_t)sleep_for);
@@ -363,14 +387,14 @@ int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) 
         return (int)cpy;
     }
     if (dev->rx_count == 0) {
-        pthread_mutex_unlock(&g_mock_lock);
+        mock_unlock();
         if (timeout_ms > 0) hidpp_plat_sleep_ms((uint32_t)(timeout_ms > 10 ? 10 : timeout_ms));
         return 0;
     }
     mock_frame_t f = dev->rx[dev->rx_head];
     dev->rx_head = (dev->rx_head + 1) % 32;
     dev->rx_count--;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
 
     int cpy = f.len > (int)cap ? (int)cap : f.len;
     memcpy(buf, f.data, (size_t)cpy);
@@ -614,11 +638,11 @@ static void test_direct_wired_no_receiver_notif_and_wake_restore(void) {
 
     /* Simulate mouse sleep-resetting its DPI back to 800, then trigger wake restore */
     int32_t rev_before = mousedpi_state_rev();
-    pthread_mutex_lock(&g_mock_lock);
+    mock_lock();
     m->dpi_x = 800;
     m->dpi_y = 800;
     m->lod = 2;
-    pthread_mutex_unlock(&g_mock_lock);
+    mock_unlock();
 
     mousedpi_request_wake_restore();
     int32_t rev_after = mousedpi_wait_rev(rev_before);
@@ -697,6 +721,28 @@ static void test_report_descriptor_parser(void) {
 }
 
 static void test_posix_config_atomic(void) {
+#if defined(_WIN32)
+    char tmp_dir[MAX_PATH];
+    DWORD tn = GetTempPathA(MAX_PATH, tmp_dir);
+    assert(tn > 0 && tn < MAX_PATH);
+    char cfg[MAX_PATH + 64];
+    snprintf(cfg, sizeof(cfg), "%smousedpi_test_%lu.ini", tmp_dir, (unsigned long)GetCurrentProcessId());
+    (void)DeleteFileA(cfg);
+
+    assert(hidpp_posix_config_write_file(cfg, 1600, 3) == 1);
+    int32_t dpi = 0, lod = 0;
+    assert(hidpp_posix_config_read_file(cfg, &dpi, &lod) == 1);
+    assert(dpi == 1600 && lod == 3);
+
+    /* Parse hand-edited INI with comments & mixed case */
+    FILE *f = fopen(cfg, "wb");
+    assert(f != NULL);
+    fprintf(f, "# comment\n[Mouse]\n  DPI = 4000 \n  LOD = 99\n");
+    fclose(f);
+    assert(hidpp_posix_config_read_file(cfg, &dpi, &lod) == 1);
+    assert(dpi == 4000 && lod == HIDPP_DEFAULT_LOD);
+    (void)DeleteFileA(cfg);
+#else
     char dir[256];
     snprintf(dir, sizeof(dir), "/tmp/mousedpi_test_%ld", (long)getpid());
     char cfg[300];
@@ -727,6 +773,7 @@ static void test_posix_config_atomic(void) {
     snprintf(nested, sizeof(nested), "%s/nested", dir);
     rmdir(nested);
     rmdir(dir);
+#endif
     printf("[PASS] test_posix_config_atomic\n");
 }
 
@@ -734,7 +781,7 @@ static void test_posix_config_atomic(void) {
 
 static volatile int g_stress_done = 0;
 
-static void *snapshot_writer_thread(void *unused) {
+static void snapshot_writer_thread(void *unused) {
     (void)unused;
     for (int i = 0; i < 2000; i++) {
         hidpp_state_t st;
@@ -759,7 +806,6 @@ static void *snapshot_writer_thread(void *unused) {
         commit_state(&st, 1);
     }
     g_stress_done = 1;
-    return NULL;
 }
 
 static void test_concurrent_snapshots(void) {
@@ -767,8 +813,8 @@ static void test_concurrent_snapshots(void) {
     ensure_core_init();
     g_stress_done = 0;
 
-    pthread_t th;
-    assert(pthread_create(&th, NULL, snapshot_writer_thread, NULL) == 0);
+    hidpp_thread_t th;
+    assert(hidpp_thread_start(&th, snapshot_writer_thread, NULL) == 1);
     while (!g_stress_done) {
         mousedpi_snapshot_capture();
         int32_t conn = mousedpi_snap_connected();
@@ -786,7 +832,7 @@ static void test_concurrent_snapshots(void) {
         }
         free(name);
     }
-    pthread_join(th, NULL);
+    hidpp_thread_join(th);
     printf("[PASS] test_concurrent_snapshots\n");
 }
 
