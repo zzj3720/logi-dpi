@@ -304,11 +304,11 @@ test "sequence readback ignores stale reads, snaps back on device rejection, and
   lg::set_dark(None)
 }
 
-test "offline write failure reverts optimistic DPI/LOD to the last confirmed values" {
+test "offline write failure reverts optimistic DPI/LOD (including 100-199 DPI) without clobbering offline startup" {
   lg::set_dark(Some(true))
   let m = Mouse::new()
   m.connected.set(true)
-  m.dpi.set(800)
+  m.dpi.set(150)
   m.lod.set(2)
   let sets : Array[(Int, Int, Int)] = []
   let worker = ui::Worker::inline(fn(cmd : Cmd, _emit : (Ev) -> Unit) -> Unit {
@@ -321,6 +321,16 @@ test "offline write failure reverts optimistic DPI/LOD to the last confirmed val
   let t = window(m, worker, [], reads=reads)
   t.frame()
 
+  // An offline startup snapshot at seq=0 must preserve config-seeded DPI (150) instead of clobbering it with 800.
+  reads.emit(Ev::Read(false, 800, 3, -1, false, "PRO X2 SUPERSTRIKE", 0))
+  t.frame(ms=16.0)
+  debug_assert(!m.connected.untracked(), "offline startup marks disconnected")
+  debug_assert(m.dpi.untracked() == 150, "offline startup must preserve seeded 150 DPI, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 2, "offline startup must preserve seeded LOD 2, got \{m.lod.untracked()}")
+
+  // Online confirmed 150 DPI, then user clicks 1600 and the mouse disconnects before write completes.
+  reads.emit(Ev::Read(true, 150, 2, 80, false, "PRO X2 SUPERSTRIKE", 0))
+  t.frame(ms=16.0)
   t.press("1600")
   t.frame(ms=16.0)
   debug_assert(sets.length() == 1, "expected 1 Set command, got \{sets.length()}")
@@ -328,11 +338,10 @@ test "offline write failure reverts optimistic DPI/LOD to the last confirmed val
   debug_assert(s_dpi == 1600, "expected Set(_, 1600, _), got dpi \{s_dpi}")
   debug_assert(m.dpi.untracked() == 1600, "optimistic update applied")
 
-  // The mouse disconnects before the write lands: core publishes an offline snapshot at this seq.
-  reads.emit(Ev::Read(false, 800, 2, -1, false, "PRO X2 SUPERSTRIKE", seq))
+  reads.emit(Ev::Read(false, 150, 2, -1, false, "PRO X2 SUPERSTRIKE", seq))
   t.frame(ms=16.0)
   debug_assert(!m.connected.untracked(), "offline snapshot marks the mouse disconnected")
-  debug_assert(m.dpi.untracked() == 800, "failed write must revert DPI to 800, got \{m.dpi.untracked()}")
+  debug_assert(m.dpi.untracked() == 150, "failed write must revert DPI to 150, got \{m.dpi.untracked()}")
   debug_assert(m.lod.untracked() == 2, "failed write must revert LOD to 2, got \{m.lod.untracked()}")
 
   worker.close()

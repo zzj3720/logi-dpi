@@ -399,6 +399,55 @@ int32_t hidpp_plat_can_hide_to_tray(void) {
     return has_tray;
 }
 
+static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const char *needle) {
+    void *err = NULL;
+    void *params = g->var_new(
+        "(ss)",
+        "org.kde.StatusNotifierWatcher",
+        "RegisteredStatusNotifierItems");
+    void *reply = g->dbus_call(
+        conn,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        params,
+        NULL,
+        0,
+        500,
+        NULL,
+        &err);
+    if (err) {
+        g->err_free(err);
+        err = NULL;
+    }
+    int found = 0;
+    if (reply) {
+        void *inner = NULL;
+        g->var_get(reply, "(v)", &inner);
+        if (inner) {
+            const char *ts = g->var_type_str(inner);
+            if (ts && strcmp(ts, "as") == 0) {
+                size_t n = g->var_n_children(inner);
+                for (size_t i = 0; i < n; i++) {
+                    void *child = g->var_get_child(inner, i);
+                    if (child) {
+                        const char *s = g->var_get_str(child, NULL);
+                        if (s && strstr(s, needle) != NULL) {
+                            found = 1;
+                        }
+                        g->var_unref(child);
+                    }
+                    if (found) break;
+                }
+            }
+            g->var_unref(inner);
+        }
+        g->var_unref(reply);
+    }
+    return found;
+}
+
 int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     gio_dbus_syms_t g;
     if (!gio_dbus_load(&g)) return 0;
@@ -414,14 +463,34 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
         return 0;
     }
 
+    char needle[128];
+    snprintf(needle, sizeof(needle), "org.kde.StatusNotifierItem-%ld-1", (long)getpid());
+
+    /* Negative timeout_ms: watch while tray stays up; return 0 as soon as the tray host
+     * or our SNI item disappears so the app can bring back a startup-hidden window,
+     * or return 1 when the core is stopping. */
+    if (timeout_ms < 0) {
+        int32_t ret = 1;
+        while (!hidpp_core_is_stopping()) {
+            if (!dbus_sni_host_registered(&g, conn) ||
+                !dbus_sni_item_registered(&g, conn, needle)) {
+                ret = 0;
+                break;
+            }
+            for (int i = 0; i < 10 && !hidpp_core_is_stopping(); i++) {
+                hidpp_plat_sleep_ms(50u);
+            }
+        }
+        g.obj_unref(conn);
+        gio_dbus_unload(&g);
+        return ret;
+    }
+
     if (!dbus_sni_host_registered(&g, conn)) {
         g.obj_unref(conn);
         gio_dbus_unload(&g);
         return 0;
     }
-
-    char needle[128];
-    snprintf(needle, sizeof(needle), "org.kde.StatusNotifierItem-%ld-1", (long)getpid());
 
     uint64_t deadline = hidpp_plat_now_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     int32_t ready = 0;
@@ -429,62 +498,9 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     for (;;) {
         if (hidpp_core_is_stopping()) break;
 
-        void *params = g.var_new(
-            "(ss)",
-            "org.kde.StatusNotifierWatcher",
-            "RegisteredStatusNotifierItems");
-        void *reply = g.dbus_call(
-            conn,
-            "org.kde.StatusNotifierWatcher",
-            "/StatusNotifierWatcher",
-            "org.freedesktop.DBus.Properties",
-            "Get",
-            params,
-            NULL,
-            0,
-            500,
-            NULL,
-            &err);
-        if (err) {
-            g.err_free(err);
-            err = NULL;
-        }
-        int found = 0;
-        if (reply) {
-            void *inner = NULL;
-            g.var_get(reply, "(v)", &inner);
-            if (inner) {
-                const char *ts = g.var_type_str(inner);
-                if (ts && strcmp(ts, "as") == 0) {
-                    size_t n = g.var_n_children(inner);
-                    for (size_t i = 0; i < n; i++) {
-                        void *child = g.var_get_child(inner, i);
-                        if (child) {
-                            const char *s = g.var_get_str(child, NULL);
-                            if (s && strstr(s, needle) != NULL) {
-                                found = 1;
-                            }
-                            g.var_unref(child);
-                        }
-                        if (found) break;
-                    }
-                }
-                g.var_unref(inner);
-            }
-            g.var_unref(reply);
-        }
-
+        int found = dbus_sni_item_registered(&g, conn, needle);
         if (found && dbus_sni_host_registered(&g, conn)) {
-            uint64_t settle_end = hidpp_plat_now_ms() + 100u;
-            while (!hidpp_core_is_stopping()) {
-                uint64_t now = hidpp_plat_now_ms();
-                if (now >= settle_end) break;
-                uint64_t rem = settle_end - now;
-                hidpp_plat_sleep_ms(rem > 20u ? 20u : (uint32_t)rem);
-            }
-            if (!hidpp_core_is_stopping() && dbus_sni_host_registered(&g, conn)) {
-                ready = 1;
-            }
+            ready = 1;
             break;
         }
 
@@ -637,12 +653,15 @@ static int probe_hidraw_rdesc(const char *hidraw_name, const char *dev_path, int
 }
 
 static void format_endpoint_id(char *out, size_t cap, const char *dev_path,
+                               unsigned long long rdev, unsigned long long ino,
                                uint16_t vid, uint16_t pid,
                                const char *phys, const char *uniq) {
     if (!out || cap == 0) return;
     char tmp[1024];
-    int n = snprintf(tmp, sizeof(tmp), "%s|%04x:%04x|%s|%s",
+    int n = snprintf(tmp, sizeof(tmp), "%s|%llx:%llx|%04x:%04x|%s|%s",
                      dev_path ? dev_path : "",
+                     rdev,
+                     ino,
                      (unsigned)vid,
                      (unsigned)pid,
                      phys ? phys : "",
@@ -699,6 +718,13 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
             continue;
         }
 
+        struct stat dev_st;
+        if (stat(dev_path, &dev_st) != 0) {
+            continue;
+        }
+        unsigned long long dev_rdev = (unsigned long long)dev_st.st_rdev;
+        unsigned long long dev_ino  = (unsigned long long)dev_st.st_ino;
+
         char base_phys[256];
         int is_usb = (strncmp(phys, "usb-", 4) == 0) ? 1 : 0;
         int is_dj_child = extract_base_phys(phys, base_phys, sizeof(base_phys));
@@ -720,7 +746,7 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
         if (dup_idx >= 0) {
             if (cands[dup_idx].is_dj_child && !is_dj_child) {
                 format_endpoint_id(cands[dup_idx].info.id, sizeof(cands[dup_idx].info.id),
-                                   dev_path, vid, pid, phys, uniq);
+                                   dev_path, dev_rdev, dev_ino, vid, pid, phys, uniq);
                 cands[dup_idx].info.vid = vid;
                 cands[dup_idx].info.pid = pid;
                 cands[dup_idx].info.kind = hidpp_classify_pid(pid);
@@ -735,7 +761,7 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
             linux_cand_t *c = &cands[ncand++];
             memset(c, 0, sizeof(*c));
             format_endpoint_id(c->info.id, sizeof(c->info.id),
-                               dev_path, vid, pid, phys, uniq);
+                               dev_path, dev_rdev, dev_ino, vid, pid, phys, uniq);
             c->info.vid = vid;
             c->info.pid = pid;
             c->info.kind = hidpp_classify_pid(pid);
@@ -766,28 +792,30 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     if (!endpoint_id || !endpoint_id[0]) return NULL;
 
     char dev_path[HIDPP_ENDPOINT_ID_MAX];
-    const char *bar = strchr(endpoint_id, '|');
-    if (bar) {
-        size_t plen = (size_t)(bar - endpoint_id);
+    int has_sig = 0;
+    unsigned long long want_rdev = 0, want_ino = 0;
+    unsigned int want_vid = 0, want_pid = 0;
+    char want_phys[256];
+    want_phys[0] = '\0';
+
+    const char *bar1 = strchr(endpoint_id, '|');
+    if (bar1) {
+        size_t plen = (size_t)(bar1 - endpoint_id);
         if (plen == 0 || plen >= sizeof(dev_path)) return NULL;
         memcpy(dev_path, endpoint_id, plen);
         dev_path[plen] = '\0';
 
-        if (strncmp(dev_path, "/dev/", 5) != 0 || dev_path[5] == '\0') {
-            return NULL;
-        }
-        const char *hidraw_name = dev_path + 5;
-        uint16_t vid = 0, pid = 0;
-        char phys[256];
-        char uniq[128];
-        if (!parse_uevent(hidraw_name, &vid, &pid, phys, sizeof(phys), uniq, sizeof(uniq))) {
-            return NULL;
-        }
-        char actual_id[HIDPP_ENDPOINT_ID_MAX];
-        format_endpoint_id(actual_id, sizeof(actual_id), dev_path, vid, pid, phys, uniq);
-        if (strcmp(actual_id, endpoint_id) != 0) {
-            return NULL;
-        }
+        const char *bar2 = strchr(bar1 + 1, '|');
+        const char *bar3 = bar2 ? strchr(bar2 + 1, '|') : NULL;
+        const char *bar4 = bar3 ? strchr(bar3 + 1, '|') : NULL;
+        if (!bar2 || !bar3 || !bar4) return NULL;
+        if (sscanf(bar1 + 1, "%llx:%llx", &want_rdev, &want_ino) != 2) return NULL;
+        if (sscanf(bar2 + 1, "%x:%x", &want_vid, &want_pid) != 2) return NULL;
+        size_t phys_len = (size_t)(bar4 - (bar3 + 1));
+        if (phys_len >= sizeof(want_phys)) phys_len = sizeof(want_phys) - 1;
+        memcpy(want_phys, bar3 + 1, phys_len);
+        want_phys[phys_len] = '\0';
+        has_sig = 1;
     } else {
         snprintf(dev_path, sizeof(dev_path), "%s", endpoint_id);
     }
@@ -799,6 +827,36 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
             *out_perm_denied = 1;
         }
         return NULL;
+    }
+
+    /* Post-open kernel-atomic identity verification directly on the opened fd
+     * (fstat rdev+ino catches any devtmpfs node replacement on the same hidraw minor,
+     * plus HIDIOCGRAWINFO / HIDIOCGRAWPHYS verify the live device behind fd). */
+    if (has_sig) {
+        struct stat fst;
+        if (fstat(fd, &fst) != 0 ||
+            (unsigned long long)fst.st_rdev != want_rdev ||
+            (unsigned long long)fst.st_ino != want_ino) {
+            close(fd);
+            return NULL;
+        }
+        struct hidraw_devinfo rawinfo;
+        memset(&rawinfo, 0, sizeof(rawinfo));
+        if (ioctl(fd, HIDIOCGRAWINFO, &rawinfo) < 0 ||
+            (uint16_t)rawinfo.vendor != (uint16_t)want_vid ||
+            (uint16_t)rawinfo.product != (uint16_t)want_pid) {
+            close(fd);
+            return NULL;
+        }
+        if (want_phys[0] != '\0') {
+            char rawphys[256];
+            memset(rawphys, 0, sizeof(rawphys));
+            if (ioctl(fd, HIDIOCGRAWPHYS(sizeof(rawphys) - 1), rawphys) < 0 ||
+                strcmp(rawphys, want_phys) != 0) {
+                close(fd);
+                return NULL;
+            }
+        }
     }
 
     hidpp_dev_t *dev = (hidpp_dev_t *)malloc(sizeof(*dev));

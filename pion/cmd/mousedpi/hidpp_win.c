@@ -212,38 +212,6 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
     return count;
 }
 
-static void extract_dev_prefix(const char *path, char *out, size_t cap) {
-    if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!path) return;
-
-    const char *cut = NULL;
-    for (const char *p = path; *p; p++) {
-        if (p[0] == '&' &&
-            tolower((unsigned char)p[1]) == 'c' &&
-            tolower((unsigned char)p[2]) == 'o' &&
-            tolower((unsigned char)p[3]) == 'l') {
-            cut = p;
-            break;
-        }
-    }
-    size_t len = cut ? (size_t)(cut - path) : strlen(path);
-    if (len >= cap) len = cap - 1;
-    memcpy(out, path, len);
-    out[len] = '\0';
-}
-
-static int path_has_prefix_ci(const char *path, const char *prefix) {
-    if (!path || !prefix || !prefix[0]) return 0;
-    size_t i = 0;
-    while (prefix[i]) {
-        if (!path[i]) return 0;
-        if (tolower((unsigned char)path[i]) != tolower((unsigned char)prefix[i])) return 0;
-        i++;
-    }
-    return (path[i] == '\0' || path[i] == '&' || path[i] == '#') ? 1 : 0;
-}
-
 /* DEVPKEY_Device_ContainerId = {8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c}, pid = 2 */
 static const DEVPROPKEY kDevPkeyContainerId = {
     { 0x8c7ed206u, 0x3f8au, 0x4827u, { 0xb3u, 0xabu, 0xaeu, 0x9eu, 0x1fu, 0xaeu, 0xfcu, 0x6cu } },
@@ -302,9 +270,6 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
         return INVALID_HANDLE_VALUE;
     }
 
-    char prefix[HIDPP_ENDPOINT_ID_MAX];
-    extract_dev_prefix(endpoint_id, prefix, sizeof(prefix));
-
     GUID hid_guid;
     HidD_GetHidGuid(&hid_guid);
     HDEVINFO info = SetupDiGetClassDevsA(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -338,8 +303,14 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
         HeapFree(GetProcessHeap(), 0, det);
     }
 
+    /* Without a verified ContainerId, do not guess across potentially identical VID/PID receivers. */
+    if (!has_target_cid) {
+        SetupDiDestroyDeviceInfoList(info);
+        return INVALID_HANDLE_VALUE;
+    }
+
     /* Pass 2: find the 7-byte short HID++ TLC belonging to the SAME physical device
-     * (matching ContainerId GUID + vid_ + pid_; never fall back to cross-device PID matching). */
+     * (strictly matching ContainerId GUID + vid_ + pid_). */
     HANDLE found = INVALID_HANDLE_VALUE;
     did.cbSize = sizeof(did);
     for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(info, NULL, &hid_guid, idx, &did); idx++) {
@@ -359,13 +330,9 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
                         parse_hex4_after(det->DevicePath, "pid_", &pid) && pid == want_pid;
             int dev_match = 0;
             if (id_ok) {
-                if (has_target_cid) {
-                    GUID cand_cid;
-                    if (get_dev_container_id(info, &devinfo, &cand_cid) &&
-                        memcmp(&cand_cid, &target_cid, sizeof(GUID)) == 0) {
-                        dev_match = 1;
-                    }
-                } else if (prefix[0] && path_has_prefix_ci(det->DevicePath, prefix)) {
+                GUID cand_cid;
+                if (get_dev_container_id(info, &devinfo, &cand_cid) &&
+                    memcmp(&cand_cid, &target_cid, sizeof(GUID)) == 0) {
                     dev_match = 1;
                 }
             }

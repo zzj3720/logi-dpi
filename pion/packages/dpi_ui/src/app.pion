@@ -64,10 +64,11 @@ fn take(m : Mouse, pending_seq : Array[Int], ev : Ev) -> Unit {
         if ok {
           m.dpi.set(dpi)
           m.lod.set(lod)
-        } else {
-          // Offline snapshot after a failed write still carries the last confirmed values:
-          // undo the optimistic DPI/LOD instead of showing a value the mouse never took.
-          if dpi >= dpi_least {
+        } else if pending_seq[0] > 0 {
+          // Offline snapshot after a failed user write still carries the last confirmed device values
+          // (device range starts at 100 DPI, below the 200 DPI slider floor): undo the optimistic values
+          // without clobbering config-seeded DPI on an offline startup (where pending_seq == 0).
+          if dpi >= 100 {
             m.dpi.set(dpi)
           }
           if lod >= 1 && lod <= 3 {

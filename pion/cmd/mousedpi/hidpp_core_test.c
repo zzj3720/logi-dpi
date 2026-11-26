@@ -68,6 +68,8 @@ typedef struct mock_device {
     uint8_t               reg00_written[3];
     int                   drain_calls;
     int                   notify_disconnect_once;
+    int                   caps_timeout;
+    int                   disconnect_after_fn6;
 
     /* Pre-queued stale frames to test drain */
     mock_frame_t          stale[8];
@@ -406,7 +408,9 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         dev_push_rx(dev, r, 20);
     } else if (feat_idx == 0x05 && fn == 1) {
         /* 0x2202 getSensorCapabilities: r[4]=sensorIdx, r[5]=numDpiLevels, r[6]=capabilities */
-        if (m->caps_present) {
+        if (m->caps_timeout) {
+            /* Simulate transient timeout: push no response */
+        } else if (m->caps_present) {
             r[4] = 0x00;
             r[5] = m->caps_num_levels;
             r[6] = m->caps_flags;
@@ -463,6 +467,9 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
                 r[9] = m->fn5_lod_zero ? 0x00 : (uint8_t)m->lod;
             }
             dev_push_rx(dev, r, 20);
+            if (m->disconnect_after_fn6) {
+                m->has_dpi_feature = 0;
+            }
         }
     } else if (feat_idx == 0x06 && fn == 1) {
         /* 0x1004 battery */
@@ -1467,7 +1474,41 @@ static void test_fn1_caps_r6_offset_and_retry_on_failure(void) {
     assert(m->last_fn6_lod == 3);
     mousedpi_stop_waits();
 
-    /* Case C: fn=1 failure must NOT permanently set g_cached_caps_read = 1 */
+    /* Case C: fn=1 failing on write attempt itself must send conservative y=0, lod=0 (never unverified Y/LOD)
+     * and bounded retry on explicit HID++ 2.0 error caches safe fallback. */
+    mock_reset();
+    g_mock_dev_count = 1;
+    m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/caps_fail_write");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->lod = 2;
+    m->fn5_lod_zero = 1;
+    m->caps_timeout = 1; /* First timeout on init */
+
+    assert(mousedpi_init_and_restore() == 1);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_cached_caps_read == 0);
+    assert(g_cached_has_indep_y == 0 && g_cached_has_lod == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+
+    /* Write while fn=1 STILL times out -> must send conservative y=0, lod=0 and bound retries */
+    int32_t rev0 = mousedpi_state_rev();
+    mousedpi_request_set_seq(1, 1600, 3);
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+    assert(m->last_fn6_y == 0 && m->last_fn6_lod == 0);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_cached_caps_read == 1); /* Bounded after 2 consecutive timeouts */
+    hidpp_mutex_unlock(&g_hid_lock);
+    mousedpi_stop_waits();
+
+    /* Case D: single timeout then retry succeeds with r[6]=0x03 */
     mock_reset();
     g_mock_dev_count = 1;
     m = &g_mock_devs[0];
@@ -1480,30 +1521,21 @@ static void test_fn1_caps_r6_offset_and_retry_on_failure(void) {
     m->dpi_x = 800;
     m->dpi_y = 800;
     m->lod = 2;
-    m->caps_present = 0; /* First call fails with HID++ 2.0 0xFF error */
-
+    m->caps_timeout = 1;
     assert(mousedpi_init_and_restore() == 1);
-    hidpp_mutex_lock(&g_hid_lock);
-    assert(g_cached_caps_read == 0);
-    hidpp_mutex_unlock(&g_hid_lock);
 
-    /* Now enable fn=1 with (r[5]=3, r[6]=0x00) and trigger a set: must retry fn=1 and honor r[6]=0x00 */
     mock_lock();
+    m->caps_timeout = 0;
     m->caps_present = 1;
-    m->caps_num_levels = 3;
-    m->caps_flags = 0x00;
+    m->caps_num_levels = 5;
+    m->caps_flags = 0x03;
     mock_unlock();
 
-    int32_t rev0 = mousedpi_state_rev();
-    mousedpi_request_set_seq(1, 1600, 3);
-    int32_t rev1 = mousedpi_wait_rev(rev0);
+    rev0 = mousedpi_state_rev();
+    mousedpi_request_set_seq(2, 1600, 3);
+    rev1 = mousedpi_wait_rev(rev0);
     assert(rev1 > rev0);
-    hidpp_mutex_lock(&g_hid_lock);
-    assert(g_cached_caps_read == 1);
-    assert(g_cached_has_indep_y == 0);
-    assert(g_cached_has_lod == 0);
-    hidpp_mutex_unlock(&g_hid_lock);
-    assert(m->last_fn6_y == 0 && m->last_fn6_lod == 0);
+    assert(m->last_fn6_y == 1600 && m->last_fn6_lod == 3);
     mousedpi_stop_waits();
     printf("[PASS] test_fn1_caps_r6_offset_and_retry_on_failure\n");
 }
@@ -1748,6 +1780,66 @@ static void test_notify_first_open_from_empty_and_no_unrelated_flicker(void) {
     printf("[PASS] test_notify_first_open_from_empty_and_no_unrelated_flicker\n");
 }
 
+static void test_single_target_write_no_spillover_to_second_mouse(void) {
+    mock_reset();
+    g_mock_dev_count = 2;
+
+    mock_device_t *a = &g_mock_devs[0];
+    snprintf(a->id, sizeof(a->id), "/dev/mouse_a");
+    a->vid = 0x046D;
+    a->pid = 0xC54D;
+    a->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    a->has_dpi_feature = 1;
+    a->active_slot = 0x01;
+    a->dpi_x = 800;
+    a->dpi_y = 800;
+    a->lod = 2;
+    a->caps_present = 1;
+    a->caps_num_levels = 5;
+    a->caps_flags = 0x03;
+
+    mock_device_t *b = &g_mock_devs[1];
+    snprintf(b->id, sizeof(b->id), "/dev/mouse_b");
+    b->vid = 0x046D;
+    b->pid = 0xC54D;
+    b->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    b->has_dpi_feature = 1;
+    b->active_slot = 0x01;
+    b->dpi_x = 1200;
+    b->dpi_y = 1200;
+    b->lod = 1;
+    b->caps_present = 1;
+    b->caps_num_levels = 5;
+    b->caps_flags = 0x03;
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(mousedpi_get_dpi_x() == 800);
+
+    /* Device A disconnects immediately after receiving fn=6, before fn=5 readback.
+     * set_dpi_locked must NOT spill the user's write onto Device B. */
+    mock_lock();
+    a->disconnect_after_fn6 = 1;
+    mock_unlock();
+
+    int cfg_before = g_mock_cfg_writes;
+    hidpp_mutex_lock(&g_hid_lock);
+    int32_t rc = set_dpi_locked(2400, 2400, 3, 1, 1, 9);
+    hidpp_mutex_unlock(&g_hid_lock);
+
+    assert(rc == -4);
+    assert(a->fn6_writes == 1);
+    assert(b->fn6_writes == 0);
+    assert(b->dpi_x == 1200);
+    assert(g_mock_cfg_writes == cfg_before);
+
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_applied_seq() == 9);
+    assert(mousedpi_snap_connected() == 0);
+
+    mousedpi_stop_waits();
+    printf("[PASS] test_single_target_write_no_spillover_to_second_mouse\n");
+}
+
 int main(void) {
     test_pid_classification();
     test_strict_frame_matching_and_drain();
@@ -1772,6 +1864,7 @@ int main(void) {
     test_fn6_always_fn5_readback_ignores_fake_echo();
     test_concurrent_stop_waits_single_ownership();
     test_notify_first_open_from_empty_and_no_unrelated_flicker();
+    test_single_target_write_no_spillover_to_second_mouse();
     printf("ALL HID++ CORE TESTS PASSED!\n");
     return 0;
 }

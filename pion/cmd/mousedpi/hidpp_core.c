@@ -445,8 +445,11 @@ static uint8_t               g_cached_idx_ob = 0;
 static uint8_t               g_cached_idx_bat = 0;
 static uint8_t               g_cached_idx_name = 0;
 static int                   g_cached_caps_read = 0;
-static int                   g_cached_has_indep_y = 1;
-static int                   g_cached_has_lod = 1;
+static int                   g_cached_caps_confirmed = 0;
+static int                   g_cached_caps_fails = 0;
+static int                   g_cached_fn5_saw_lod = 0;
+static int                   g_cached_has_indep_y = 0;
+static int                   g_cached_has_lod = 0;
 static uint64_t              g_notif_enabled_gen = 0;
 static char                  g_last_connected_ep_id[HIDPP_ENDPOINT_ID_MAX];
 static uint8_t               g_last_connected_dev_idx = 0;
@@ -557,8 +560,11 @@ static void invalidate_feature_cache_locked(void) {
     g_cached_idx_bat = 0;
     g_cached_idx_name = 0;
     g_cached_caps_read = 0;
-    g_cached_has_indep_y = 1;
-    g_cached_has_lod = 1;
+    g_cached_caps_confirmed = 0;
+    g_cached_caps_fails = 0;
+    g_cached_fn5_saw_lod = 0;
+    g_cached_has_indep_y = 0;
+    g_cached_has_lod = 0;
 }
 
 static void invalidate_cache_locked(void) {
@@ -894,12 +900,23 @@ static void ensure_dpi_caps_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t id
     uint8_t p0[1] = { 0x00u };
     /* 0x2202 fn=1 getSensorCapabilities response:
      * [0x11, dev_idx, feat_idx, fn_sw, sensorIdx(r[4]), numDpiLevels(r[5]), capabilities(r[6]), ...] */
-    if (hidpp_xfer(dev, dev_idx, idx_dpi, 1, p0, 1, r, &got) == HIDPP_XFER_OK &&
-        got >= 7 && r[4] == 0x00u) {
+    int rc = hidpp_xfer(dev, dev_idx, idx_dpi, 1, p0, 1, r, &got);
+    if (rc == HIDPP_XFER_OK && got >= 7 && r[4] == 0x00u) {
         uint8_t flags = r[6];
-        g_cached_has_indep_y = (flags & 0x01u) ? 1 : 0;
-        g_cached_has_lod     = (flags & 0x02u) ? 1 : 0;
-        g_cached_caps_read   = 1;
+        g_cached_has_indep_y    = (flags & 0x01u) ? 1 : 0;
+        g_cached_has_lod        = (flags & 0x02u) ? 1 : 0;
+        g_cached_caps_confirmed = 1;
+        g_cached_caps_read      = 1;
+        g_cached_caps_fails     = 0;
+    } else {
+        /* Safe conservative fallback: never send unverified Y/LOD when fn=1 fails.
+         * Bound retries on explicit HID++ 2.0 error or repeated timeouts so refreshes don't stall. */
+        g_cached_has_indep_y = 0;
+        g_cached_has_lod     = g_cached_fn5_saw_lod;
+        g_cached_caps_fails++;
+        if (rc == HIDPP_XFER_ERR_HIDPP2 || g_cached_caps_fails >= 2) {
+            g_cached_caps_read = 1;
+        }
     }
 }
 
@@ -921,7 +938,11 @@ static int read_sensor_dpi_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx
     }
     int32_t dy = ((int32_t)r[9] << 8) | r[10];
     if (dy < HIDPP_MIN_DPI) dy = dx;
-    if (r[13] == 0) {
+    if (r[13] >= 1 && r[13] <= 3) {
+        g_cached_fn5_saw_lod = 1;
+        if (!g_cached_caps_confirmed) g_cached_has_lod = 1;
+    } else if (r[13] == 0) {
+        g_cached_fn5_saw_lod = 0;
         g_cached_has_lod = 0;
     }
     int32_t lod = (r[13] >= 1 && r[13] <= 3) ? (int32_t)r[13] : fallback_lod;
@@ -1106,15 +1127,15 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg,
             return -3;
         }
 
-        /* Always confirm actual applied DPI/LOD from sensor via fn=5 readback. */
+        /* Always confirm actual applied DPI/LOD from sensor via fn=5 readback.
+         * Never retry onto a different re-enumerated mouse after fn=6 already landed on this target. */
         int32_t rx = 0, ry = 0, rlod = st.lod;
         if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
             hidpp_plat_close(dev);
             invalidate_cache_locked();
-            if (was_cached) continue;
             st.connected = 0;
             commit_state_seq(&st, bump_rev, min_applied_seq);
-            return -3;
+            return -4;
         }
         st.dpi_x = rx;
         st.dpi_y = ry;
@@ -1539,6 +1560,11 @@ int32_t mousedpi_init_and_restore(void) {
             }
         } else if (ok && !g_cached_has_lod) {
             g_saved_lod = st.lod;
+        } else if (!ok) {
+            st.dpi_x = cfg_dpi;
+            st.dpi_y = cfg_dpi;
+            st.lod = cfg_lod;
+            commit_state(&st, 0);
         }
     } else if (ok) {
         hidpp_state_t st = load_live_state();
