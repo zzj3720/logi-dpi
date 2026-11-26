@@ -8,16 +8,16 @@ pub enum Cmd {
   Refresh
   /// Restore saved DPI/LOD after system wake or long inactivity, then refresh state.
   WakeRestore
-  /// Write DPI (both axes) and lift-off distance (1 low, 2 medium, 3 high).
-  Set(Int, Int)
+  /// Write DPI (both axes) and lift-off distance (1 low, 2 medium, 3 high) with a monotonic request sequence.
+  Set(Int, Int, Int)
   /// Start with the system (put away to the tray when available) or not.
   Autostart(Bool)
 }
 
 /// What comes back.
 pub enum Ev {
-  /// A read of the mouse: (connected, dpi, lod, battery percent [-1 unknown], perm_denied, device_name).
-  Read(Bool, Int, Int, Int, Bool, String)
+  /// A read of the mouse: (connected, dpi, lod, battery percent [-1 unknown], perm_denied, device_name, applied_seq).
+  Read(Bool, Int, Int, Int, Bool, String, Int)
   /// Whether it starts with the system now.
   Autostarts(Bool)
 }
@@ -30,14 +30,16 @@ pub fn stand_in(
 ) -> (Cmd, (Ev) -> Unit) -> Unit {
   let dpi : Array[Int] = [800]
   let lod : Array[Int] = [2]
+  let last_seq : Array[Int] = [0]
   fn(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
     match cmd {
-      Cmd::Refresh => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name))
-      Cmd::WakeRestore => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name))
-      Cmd::Set(d, l) => {
+      Cmd::Refresh => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name, last_seq[0]))
+      Cmd::WakeRestore => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name, last_seq[0]))
+      Cmd::Set(seq, d, l) => {
         dpi[0] = d
         lod[0] = l
-        emit(Ev::Read(!perm_denied, d, l, if perm_denied { -1 } else { battery }, perm_denied, device_name))
+        last_seq[0] = seq
+        emit(Ev::Read(!perm_denied, d, l, if perm_denied { -1 } else { battery }, perm_denied, device_name, last_seq[0]))
       }
       Cmd::Autostart(on) => emit(Ev::Autostarts(on))
     }

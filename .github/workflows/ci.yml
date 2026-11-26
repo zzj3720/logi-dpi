@@ -83,12 +83,19 @@ jobs:
             pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
           ./out/hidpp_core_test
 
+      - name: Compile-check C/ObjC backend sources
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -c pion/cmd/mousedpi/hidpp_core.c -o /tmp/c.o
+          clang -fobjc-arc -O2 -Wall -Wextra -Werror -c pion/cmd/mousedpi/hidpp_macos.m -o /tmp/m.o
+          rm -f /tmp/c.o /tmp/m.o
+
       - name: Build macOS app bundle
         run: |
           sh tools/build-macos.sh
           test -x out/MouseDPI
           test -x out/MouseDPI.app/Contents/MacOS/MouseDPI
           test -f out/MouseDPI.app/Contents/Info.plist
+          test -f out/MouseDPI.app/Contents/Resources/AppIcon.icns
 
   linux:
     runs-on: ubuntu-latest
@@ -175,13 +182,24 @@ jobs:
             pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
           ./out/hidpp_core_test
 
+      - name: Compile-check C backend sources
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -c pion/cmd/mousedpi/hidpp_core.c -o /tmp/c.o
+          cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -c pion/cmd/mousedpi/hidpp_linux.c -o /tmp/l.o
+          rm -f /tmp/c.o /tmp/l.o
+
       - name: Build Linux binary
         run: |
           sh tools/build-linux.sh
           test -x out/mousedpi
 
+      - name: Build Linux shots binary
+        run: |
+          "$PIONC" build --release pion/cmd/shots -o out/dpi_shots
+          test -x out/dpi_shots
+
       - name: Shell script syntax check
-        run: sh -n tools/deps.sh tools/build-macos.sh tools/build-linux.sh tools/install-linux.sh tools/build-win.sh
+        run: for s in tools/deps.sh tools/build-macos.sh tools/build-linux.sh tools/install-linux.sh tools/build-win.sh; do sh -n "$s"; done
 
   windows:
     runs-on: windows-latest
@@ -260,6 +278,14 @@ jobs:
           "$LLVM_BIN/clang.exe" -std=c11 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS -DHIDPP_CORE_TEST -I pion/cmd/mousedpi \
             pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test.exe
           ./out/hidpp_core_test.exe
+
+      - name: Compile-check C backend sources (MSVC clang)
+        run: |
+          mkdir -p out
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          "$LLVM_BIN/clang.exe" -std=c11 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS -c pion/cmd/mousedpi/hidpp_core.c -o out/c.obj
+          "$LLVM_BIN/clang.exe" -std=c11 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS -c pion/cmd/mousedpi/hidpp_win.c -o out/w.obj
+          rm -f out/c.obj out/w.obj
 
       - name: Build Windows binary (MSVC clang + lld)
         run: |
