@@ -18,7 +18,7 @@ fi
 
 $SUDO install -Dm755 "$BIN" "$PREFIX/bin/mousedpi"
 $SUDO install -Dm644 "$ROOT/assets/mouse.png" "$PREFIX/share/mousedpi/mouse.png"
-$SUDO install -Dm644 "$ROOT/assets/mouse.png" "$PREFIX/share/icons/hicolor/256x256/apps/com.zzj3720.MouseDPI.png"
+$SUDO install -Dm644 "$ROOT/assets/icon-256.png" "$PREFIX/share/icons/hicolor/256x256/apps/com.zzj3720.MouseDPI.png"
 $SUDO install -Dm644 "$ROOT/assets/com.zzj3720.MouseDPI.desktop" "$PREFIX/share/applications/com.zzj3720.MouseDPI.desktop"
 $SUDO install -Dm644 "$ROOT/assets/70-logi-dpi.rules" /etc/udev/rules.d/70-logi-dpi.rules
 
