@@ -61,10 +61,13 @@ static int             g_mgr_open_denied = 0;
 
 static pthread_mutex_t g_mgr_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_mgr_ready_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_mgr_stop_cv = PTHREAD_COND_INITIALIZER;
 static int             g_mgr_started = 0;
 static int             g_mgr_ready = 0;
 static int             g_mgr_stopping = 0;
 static int             g_mgr_stopped = 0;
+static int             g_mgr_stop_claimed = 0;
+static int             g_mgr_stop_done = 0;
 static pthread_t       g_mgr_thread;
 static CFRunLoopRef    g_mgr_runloop = NULL;
 
@@ -180,7 +183,7 @@ static void input_report_cb(void *ctx, IOReturn res, void *sender,
         (norm[0] == HIDPP_SHORT_REPORT_ID || norm[0] == HIDPP_LONG_REPORT_ID) &&
         norm[2] == 0x41u &&
         ((norm[4] & 0x40u) == 0u)) {
-        hidpp_core_signal_wake();
+        hidpp_core_signal_wake_reconnect();
     }
 
     pthread_mutex_lock(&slot->lock);
@@ -420,9 +423,19 @@ void hidpp_plat_start_watchers(void) {
 
 void hidpp_plat_stop_watchers(void) {
     pthread_mutex_lock(&g_mgr_lock);
+    if (g_mgr_stop_claimed) {
+        while (!g_mgr_stop_done) {
+            pthread_cond_wait(&g_mgr_stop_cv, &g_mgr_lock);
+        }
+        pthread_mutex_unlock(&g_mgr_lock);
+        return;
+    }
+    g_mgr_stop_claimed = 1;
+    g_mgr_stop_done = 0;
     g_mgr_stopping = 1;
     g_mgr_stopped = 1;
     int was_started = g_mgr_started;
+    pthread_t mgr_th = g_mgr_thread;
     if (was_started) {
         while (!g_mgr_ready) {
             pthread_cond_wait(&g_mgr_ready_cv, &g_mgr_lock);
@@ -439,12 +452,17 @@ void hidpp_plat_stop_watchers(void) {
         CFRelease(rl);
     }
     if (was_started) {
-        pthread_join(g_mgr_thread, NULL);
-        pthread_mutex_lock(&g_mgr_lock);
+        pthread_join(mgr_th, NULL);
+    }
+
+    pthread_mutex_lock(&g_mgr_lock);
+    if (was_started) {
         g_mgr_started = 0;
         g_mgr_ready = 0;
-        pthread_mutex_unlock(&g_mgr_lock);
     }
+    g_mgr_stop_done = 1;
+    pthread_cond_broadcast(&g_mgr_stop_cv);
+    pthread_mutex_unlock(&g_mgr_lock);
 }
 
 int hidpp_plat_needs_notify_thread(void) {

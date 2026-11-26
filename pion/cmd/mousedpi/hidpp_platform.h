@@ -93,6 +93,7 @@ typedef struct hidpp_dev hidpp_dev_t;
 
 /* ---- Core hooks callable from platform layer ---- */
 void hidpp_core_signal_wake(void);
+void hidpp_core_signal_wake_reconnect(void);
 void hidpp_core_signal_topology_change(void);
 int  hidpp_core_is_stopping(void);
 
