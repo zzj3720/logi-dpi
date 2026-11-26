@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "pion/packages/dpi_ui",
+  "pion/cmd/mousedpi",
+  "pion/cmd/shots",
+]
+
+[workspace.dependencies]
+film = { path = "deps/invar/packages/film" }
+host = { path = "deps/invar/packages/host" }
+hostapi = { path = "deps/invar/packages/hostapi" }
+lg = { path = "deps/invar/packages/lg" }
+signals = { path = "deps/invar/packages/signals" }
+ui = { path = "deps/invar/packages/ui" }
+view = { path = "deps/invar/packages/view" }

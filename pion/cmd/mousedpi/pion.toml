@@ -1,6 +1,6 @@
 [package]
 name = "mousedpi"
-version = "0.4.0"
+version = "0.5.0"
 
 [dependencies]
 dpi_ui = { path = "../../packages/dpi_ui" }
@@ -11,8 +11,18 @@ signals = { path = "../../../deps/invar/packages/signals" }
 ui = { path = "../../../deps/invar/packages/ui" }
 view = { path = "../../../deps/invar/packages/view" }
 
+[link.macos]
+c_sources = ["hidpp_core.c", "hidpp_macos.m"]
+cc_flags = ["-O2", "-fobjc-arc"]
+frameworks = ["IOKit", "CoreFoundation", "ApplicationServices", "Foundation"]
+
+[link.linux]
+c_sources = ["hidpp_core.c", "hidpp_linux.c"]
+cc_flags = ["-O2", "-pthread"]
+libs = ["pthread", "dl"]
+
 [link.windows]
-c_sources = ["hidpp_win.c"]
+c_sources = ["hidpp_core.c", "hidpp_win.c"]
 cc_flags = ["-O2"]
 libs = ["hid", "setupapi", "user32", "advapi32", "powrprof"]
 # the window/tray/taskbar icon and the host's MBUI_ENV (tools/build-win.sh makes app.res) and a GUI app (no console)

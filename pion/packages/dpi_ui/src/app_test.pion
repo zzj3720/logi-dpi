@@ -1,40 +1,201 @@
 // The window over a stand-in mouse (`Worker::inline`): invar's Apple two-layer gate (no glass on glass, content layer
-// solid, nothing unscrollable, craft) light and dark, connected and not, and what each control asks of the worker.
+// solid, nothing unscrollable, craft, shadow_clip_faults) across light/dark, connected/disconnected/low-battery/perm-denied,
+// macOS/WinLinux chrome, dynamic battery 21->20->21->-1, and 640x340 minimum size with a long device name.
 
 import "lg"
 import "ui"
 import "view"
 
-fn window(m : Mouse, worker : ui::Worker[Cmd, Ev], acts : Array[Int]) -> ui::Tester {
+fn window(
+  m : Mouse,
+  worker : ui::Worker[Cmd, Ev],
+  acts : Array[Int],
+  width~ : Double = 780.0,
+  height~ : Double = 360.0,
+  show_window_controls~ : Bool = true,
+  macos_inset~ : Bool = false,
+  close_label~ : String = "关闭到托盘",
+  platform~ : Int = 3,
+) -> ui::Tester {
   ui::Tester::tree(
     fn(root : view::View) -> Unit {
-      app(root, m, worker, window_act=fn(w : Int) -> Unit { acts.push(w) }, picture="")
+      app(
+        root,
+        m,
+        worker,
+        window_act=fn(w : Int) -> Unit { acts.push(w) },
+        picture="",
+        show_window_controls=show_window_controls,
+        macos_inset=macos_inset,
+        close_label=close_label,
+      )
     },
-    width=780.0,
-    height=360.0,
+    width=width,
+    height=height,
+    platform=platform,
     theme=lg::ui_theme,
   )
 }
 
-test "dpi window passes the apple two-layer gate, light and dark, connected and not" {
+fn assert_clean_ui(t : ui::Tester, label : String) -> Unit {
+  lg::assert_apple_ui(t, label=label)
+  let sf = t.shadow_clip_faults(sigma=2.0, include_viewport=false)
+  if sf.length() > 0 {
+    debug_assert(false, "[\{label}] shadow_clip_faults (\{sf.length()}): \{sf[0]}")
+  }
+}
+
+test "dpi window passes apple two-layer gate across light/dark, states, and macOS/WinLinux chrome" {
   for dark in [false, true] {
-    for connected in [true, false] {
+    for is_mac in [false, true] {
+      // 1. Connected normal battery
       lg::set_dark(Some(dark))
       let m = Mouse::new()
-      m.connected.set(connected)
+      m.connected.set(true)
       m.dpi.set(1600)
-      m.battery.set(if connected { 76 } else { -1 })
+      m.battery.set(76)
       let worker = ui::Worker::inline(stand_in(76))
-      let t = window(m, worker, [])
+      let t = window(
+        m,
+        worker,
+        [],
+        show_window_controls=!is_mac,
+        macos_inset=is_mac,
+        close_label=if is_mac { "关闭" } else { "关闭到托盘" },
+        platform=if is_mac { 0 } else { 3 },
+      )
+      if is_mac {
+        t.fake.window_inset_flag = true
+        t.fake.frame_requested = true
+      }
       t.frame()
-      debug_assert(t.find("PRO X2 SUPERSTRIKE").is_some(), "the title is shown")
-      debug_assert(t.find("1600").is_some(), "the DPI is read out")
-      debug_assert(t.find("电量 76%").is_some() == connected, "the battery shows only while connected")
-      lg::assert_apple_ui(t, label="dpi_dark_\{dark}_connected_\{connected}")
+      debug_assert(t.find("PRO X2 SUPERSTRIKE").is_some(), "title is shown")
+      debug_assert(t.find("1600").is_some(), "DPI is read out")
+      debug_assert(t.find("电量 76%").is_some(), "battery shows while connected")
+      debug_assert(t.get("最小化").is_some() == !is_mac, "window controls only on Win/Linux")
+      assert_clean_ui(t, "dpi_conn_dark_\{dark}_mac_\{is_mac}")
       worker.close()
       t.dispose()
+
+      // 2. Disconnected
+      let m_off = Mouse::new()
+      m_off.connected.set(false)
+      m_off.dpi.set(800)
+      m_off.battery.set(-1)
+      let w_off = ui::Worker::inline(stand_in(76))
+      let t_off = window(
+        m_off,
+        w_off,
+        [],
+        show_window_controls=!is_mac,
+        macos_inset=is_mac,
+        platform=if is_mac { 0 } else { 5 },
+      )
+      if is_mac {
+        t_off.fake.window_inset_flag = true
+        t_off.fake.frame_requested = true
+      }
+      t_off.frame()
+      debug_assert(t_off.find("未连接").is_some(), "offline subtitle")
+      debug_assert(t_off.find("电量 76%").is_none(), "no battery while offline")
+      assert_clean_ui(t_off, "dpi_off_dark_\{dark}_mac_\{is_mac}")
+      w_off.close()
+      t_off.dispose()
+
+      // 3. Low battery
+      let m_low = Mouse::new()
+      m_low.connected.set(true)
+      m_low.dpi.set(1200)
+      m_low.battery.set(15)
+      let w_low = ui::Worker::inline(stand_in(15))
+      let t_low = window(
+        m_low,
+        w_low,
+        [],
+        show_window_controls=!is_mac,
+        macos_inset=is_mac,
+        platform=if is_mac { 0 } else { 3 },
+      )
+      t_low.frame()
+      debug_assert(t_low.find("电量 15%").is_some(), "low battery badge shown")
+      assert_clean_ui(t_low, "dpi_low_dark_\{dark}_mac_\{is_mac}")
+      w_low.close()
+      t_low.dispose()
+
+      // 4. Permission denied
+      let m_perm = Mouse::new()
+      m_perm.connected.set(false)
+      m_perm.perm_denied.set(true)
+      m_perm.dpi.set(800)
+      m_perm.battery.set(-1)
+      let w_perm = ui::Worker::inline(stand_in(-1, perm_denied=true))
+      let t_perm = window(
+        m_perm,
+        w_perm,
+        [],
+        show_window_controls=!is_mac,
+        macos_inset=is_mac,
+        close_label="关闭",
+        platform=if is_mac { 0 } else { 5 },
+      )
+      t_perm.frame()
+      debug_assert(t_perm.find("需要 HID 权限").is_some(), "perm_denied subtitle shown")
+      assert_clean_ui(t_perm, "dpi_perm_dark_\{dark}_mac_\{is_mac}")
+      w_perm.close()
+      t_perm.dispose()
     }
   }
+  lg::set_dark(None)
+}
+
+test "dynamic battery transitions 21 -> 20 -> 21 -> -1 on the same tree" {
+  lg::set_dark(Some(true))
+  let m = Mouse::new()
+  m.connected.set(true)
+  m.battery.set(21)
+  let worker = ui::Worker::inline(stand_in(21))
+  let t = window(m, worker, [])
+  t.frame()
+  debug_assert(t.find("电量 21%").is_some(), "battery 21% shown in Success branch")
+  assert_clean_ui(t, "dyn_bat_21")
+
+  m.battery.set(20)
+  t.frame(ms=16.0)
+  debug_assert(t.find("电量 20%").is_some(), "battery 20% shown in Warning branch")
+  debug_assert(t.find("电量 21%").is_none(), "old 21% badge hidden")
+  assert_clean_ui(t, "dyn_bat_20")
+
+  m.battery.set(21)
+  t.frame(ms=16.0)
+  debug_assert(t.find("电量 21%").is_some(), "battery 21% restored in Success branch")
+  debug_assert(t.find("电量 20%").is_none(), "old 20% badge hidden")
+  assert_clean_ui(t, "dyn_bat_21_again")
+
+  m.battery.set(-1)
+  t.frame(ms=16.0)
+  debug_assert(t.find("电量 21%").is_none(), "negative battery hides badge")
+  assert_clean_ui(t, "dyn_bat_neg")
+
+  worker.close()
+  t.dispose()
+  lg::set_dark(None)
+}
+
+test "minimum 640x340 window with long device name passes apple ui and shadow clip gates" {
+  lg::set_dark(Some(false))
+  let m = Mouse::new()
+  m.connected.set(true)
+  m.dpi.set(3200)
+  m.battery.set(88)
+  m.device_name.set("PRO X SUPERLIGHT 2 DEX WIRELESS GAMING MOUSE")
+  let worker = ui::Worker::inline(stand_in(88, device_name="PRO X SUPERLIGHT 2 DEX WIRELESS GAMING MOUSE"))
+  let t = window(m, worker, [], width=640.0, height=340.0, show_window_controls=true, close_label="关闭")
+  t.frame()
+  debug_assert(t.find("3200").is_some(), "DPI shown at 640x340")
+  debug_assert(t.find("电量 88%").is_some(), "battery shown at 640x340")
+  assert_clean_ui(t, "min_640x340_long_name")
+  worker.close()
+  t.dispose()
   lg::set_dark(None)
 }
 
@@ -42,7 +203,7 @@ test "the controls ask the worker, and its reads come back into the window" {
   lg::set_dark(Some(true))
   let m = Mouse::new()
   m.connected.set(true)
-  let worker = ui::Worker::inline(stand_in(55))
+  let worker = ui::Worker::inline(stand_in(55, device_name="G PRO X SUPERLIGHT 2"))
   let acts : Array[Int] = []
   let t = window(m, worker, acts)
   t.frame()
@@ -55,11 +216,12 @@ test "the controls ask the worker, and its reads come back into the window" {
   t.frame(ms=16.0)
   debug_assert(m.lod.untracked() == 3, "the segmented control sets LOD 3, got \{m.lod.untracked()}")
   debug_assert(m.dpi.untracked() == 1200, "the DPI stays as LOD changes")
-  // refresh: a read with the battery comes back
+  // refresh: a read with the battery and dynamic device name comes back
   t.press("刷新")
   t.frame(ms=16.0)
   debug_assert(m.battery.untracked() == 55, "refresh reads the battery, got \{m.battery.untracked()}")
-  // start with Windows: what the worker says it is now
+  debug_assert(m.device_name.untracked() == "G PRO X SUPERLIGHT 2", "refresh updates dynamic device name")
+  // autostart toggle
   t.press("开机自启")
   t.frame(ms=16.0)
   debug_assert(m.autostart.untracked(), "the toggle asks for autostart and takes the worker's answer")
@@ -67,7 +229,7 @@ test "the controls ask the worker, and its reads come back into the window" {
   t.press("最小化")
   t.press("关闭到托盘")
   debug_assert(acts.length() == 2 && acts[0] == 1 && acts[1] == 3, "minimize is 1, close (to the tray) is 3")
-  lg::assert_apple_ui(t, label="dpi_after_controls")
+  assert_clean_ui(t, "dpi_after_controls")
   worker.close()
   t.dispose()
   lg::set_dark(None)
