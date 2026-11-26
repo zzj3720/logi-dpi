@@ -8,7 +8,7 @@ No Logitech G HUB. No "Loading resources…" infinite spinner. No background ser
 
 ## Features
 
-- **Cross-Platform Native GPU UI**: Built on `invar@0947166` with Apple Two-Layer Liquid Glass (`<lg::PageShell>` solid content layer + floating glass top bar islands) rendered natively via Metal (macOS), EGL/GLES3 + GTK4 (Linux), and Direct3D 11 + DirectWrite (Windows).
+- **Cross-Platform Native GPU UI**: Built on `invar@cb3162c` (Liquid Glass v7–v11d) with Apple Two-Layer Liquid Glass (`<lg::PageShell>` solid content layer + floating glass top bar islands) rendered natively via Metal (macOS), EGL/GLES3 + GTK4 (Linux), and Direct3D 11 + DirectWrite (Windows).
 - **Direct USB HID++ 2.0 (`0x2202`)**: Shared `hidpp_core.c` protocol engine over native OS transports:
   - **macOS**: IOKit `IOHIDManager` (`hidpp_macos.m`), LaunchAgent autostart, native traffic lights & menu bar status item.
   - **Linux**: `/dev/hidraw` + full HID Report Descriptor parser (`hidpp_linux.c`), XDG autostart, StatusNotifier tray support, and udev `uaccess` rule (`assets/70-logi-dpi.rules`).

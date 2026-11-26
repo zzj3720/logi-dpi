@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  PION_REV: 585688d11bc507ddd86768ba46631308065f1adb
+  PION_REV: 70f3fac33232916aaa6420b926199d6b96d7e4ec
 
 jobs:
   build-macos:
@@ -285,7 +285,7 @@ jobs:
           {
             echo "## MouseDPI ${TAG}"
             echo ""
-            echo "Upgraded to latest \`AFK-surf/invar\` (\`0947166\`) with native desktop support for **macOS (arm64)**, **Windows (x64)**, and **Linux (x64)**."
+            echo "Upgraded to latest \`AFK-surf/invar\` (\`cb3162c\`, Liquid Glass v7–v11d + adaptive light-glass ink) with native desktop support for **macOS (arm64)**, **Windows (x64)**, and **Linux (x64)**."
             echo ""
             echo "### Downloads"
             echo "- **macOS (Apple Silicon / arm64)**: \`MouseDPI-macos-arm64-${TAG}.zip\` (unzip and drag \`MouseDPI.app\` to Applications; grant Input Monitoring on first launch)"

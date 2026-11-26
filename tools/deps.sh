@@ -2,7 +2,7 @@
 # Fetches the pinned invar (pure-Pion UI framework + Liquid Glass `lg`) into deps/invar.
 # Compatible with an existing git checkout or a symlinked local invar checkout.
 set -e
-REV=09471669821896647e4e469022f0f858c86d5c1b
+REV=cb3162c353f266800657f3780281df93b7109e59
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 DIR="$ROOT/deps/invar"
 REPO="${INVAR_REPO:-https://github.com/AFK-surf/invar.git}"

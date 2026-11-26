@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  PION_REV: 585688d11bc507ddd86768ba46631308065f1adb
+  PION_REV: 70f3fac33232916aaa6420b926199d6b96d7e4ec
 
 jobs:
   macos:
