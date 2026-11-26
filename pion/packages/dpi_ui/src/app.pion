@@ -60,11 +60,22 @@ fn take(m : Mouse, pending_seq : Array[Int], ev : Ev) -> Unit {
       if device_name != "" {
         m.device_name.set(device_name)
       }
-      if ok {
-        if applied_seq >= pending_seq[0] {
+      if applied_seq >= pending_seq[0] {
+        if ok {
           m.dpi.set(dpi)
           m.lod.set(lod)
+        } else {
+          // Offline snapshot after a failed write still carries the last confirmed values:
+          // undo the optimistic DPI/LOD instead of showing a value the mouse never took.
+          if dpi >= dpi_least {
+            m.dpi.set(dpi)
+          }
+          if lod >= 1 && lod <= 3 {
+            m.lod.set(lod)
+          }
         }
+      }
+      if ok {
         m.battery.set(battery)
       }
     }

@@ -148,6 +148,10 @@ fn main(world : World) -> Int {
     for said in hostapi::system_said(json) {
       match said {
         hostapi::SystemSaid::Shown(away) => {
+          if is_linux {
+            // Brought back from the put-away state: keep window_shown in sync (idempotent when visible).
+            hostapi::window_show()
+          }
           if is_windows {
             let _ = worker.send(dpi_ui::Cmd::Refresh)
           } else if away >= 5000.0 {
@@ -201,16 +205,25 @@ fn main(world : World) -> Int {
         )
         if is_macos {
           // Align macOS traffic lights vertically with the 44pt top bar (padding top 10 -> y=32).
-          // Called after the first window slot exists and before window_show().
+          // This build callback runs before the native host creates the first window slot, where
+          // window_buttons_down is a no-op; defer it once to the first frame, when the slot exists.
           // Do NOT register set_window_close on macOS: let mac_app.m handle native hide/reopen & Shown.
-          hostapi::window_buttons_down(10.0, 0.0)
+          let aligned : Array[Bool] = [false]
+          let _ = ui::on_before_frame(fn() {
+            if !aligned[0] {
+              aligned[0] = true
+              hostapi::window_buttons_down(10.0, 0.0)
+            }
+          })
         }
         // Shown once its first frame is drawn, unless started hidden in the tray.
         if linux_wait_tray {
           let _ = ui::on_before_frame(fn() {
             let _ = tray_decisions.drain(fn(ready : Bool) -> Unit {
               if ready {
-                hostapi::window_hide()
+                // Put away through the native close path (records put_away_at) so the window
+                // comes back on its own if the tray watcher later disappears.
+                hostapi::window_act(3)
               } else {
                 hostapi::window_show()
               }
