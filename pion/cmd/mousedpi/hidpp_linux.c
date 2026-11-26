@@ -9,9 +9,11 @@
 #include <limits.h>
 #include <linux/hidraw.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -35,6 +37,11 @@ static int  g_linux_inited = 0;
 static char g_exe_path[PATH_MAX] = {0};
 static char g_exe_dir[PATH_MAX]  = {0};
 static char g_cfg_path[PATH_MAX] = {0};
+
+static pthread_mutex_t g_linux_watch_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_watch_started = 0;
+static pthread_t       g_watch_thread;
+static int             g_watch_pipe[2] = { -1, -1 };
 
 static void resolve_xdg_config_dir(char *buf, size_t cap) {
     const char *xdg = getenv("XDG_CONFIG_HOME");
@@ -70,11 +77,120 @@ void hidpp_plat_init(void) {
     }
 }
 
+static void *linux_inotify_thread_main(void *unused) {
+    (void)unused;
+    int in_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (in_fd < 0) return NULL;
+
+    int wd = inotify_add_watch(in_fd, "/dev", IN_CREATE | IN_DELETE);
+    if (wd < 0) {
+        close(in_fd);
+        return NULL;
+    }
+
+    int wake_fd = -1;
+    pthread_mutex_lock(&g_linux_watch_lock);
+    wake_fd = g_watch_pipe[0];
+    pthread_mutex_unlock(&g_linux_watch_lock);
+
+    while (!hidpp_core_is_stopping()) {
+        struct pollfd pfds[2];
+        pfds[0].fd = in_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = wake_fd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+
+        int prc = poll(pfds, wake_fd >= 0 ? 2 : 1, 500);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (prc == 0) continue;
+        if (wake_fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            break;
+        }
+        if (pfds[0].revents & POLLIN) {
+            uint8_t buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+            int hit = 0;
+            for (;;) {
+                ssize_t n = read(in_fd, buf, sizeof(buf));
+                if (n <= 0) {
+                    if (n < 0 && errno == EINTR) continue;
+                    break;
+                }
+                ssize_t off = 0;
+                while (off + (ssize_t)sizeof(struct inotify_event) <= n) {
+                    const struct inotify_event *ev = (const struct inotify_event *)(buf + off);
+                    if (ev->len > 0 && strncmp(ev->name, "hidraw", 6) == 0) {
+                        hit = 1;
+                    }
+                    off += (ssize_t)sizeof(struct inotify_event) + (ssize_t)ev->len;
+                }
+            }
+            if (hit) {
+                hidpp_core_signal_topology_change();
+            }
+        }
+    }
+
+    (void)inotify_rm_watch(in_fd, wd);
+    close(in_fd);
+    return NULL;
+}
+
 void hidpp_plat_start_watchers(void) {
-    /* Linux uses hid_notify_thread (0x41) + 30s refresher + Shown(away) wake restore. */
+    pthread_mutex_lock(&g_linux_watch_lock);
+    if (g_watch_started || hidpp_core_is_stopping()) {
+        pthread_mutex_unlock(&g_linux_watch_lock);
+        return;
+    }
+    if (pipe2(g_watch_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        g_watch_pipe[0] = -1;
+        g_watch_pipe[1] = -1;
+        pthread_mutex_unlock(&g_linux_watch_lock);
+        return;
+    }
+    if (pthread_create(&g_watch_thread, NULL, linux_inotify_thread_main, NULL) == 0) {
+        g_watch_started = 1;
+    } else {
+        close(g_watch_pipe[0]);
+        close(g_watch_pipe[1]);
+        g_watch_pipe[0] = -1;
+        g_watch_pipe[1] = -1;
+    }
+    pthread_mutex_unlock(&g_linux_watch_lock);
 }
 
 void hidpp_plat_stop_watchers(void) {
+    pthread_mutex_lock(&g_linux_watch_lock);
+    if (!g_watch_started) {
+        pthread_mutex_unlock(&g_linux_watch_lock);
+        return;
+    }
+    g_watch_started = 0;
+    pthread_t th = g_watch_thread;
+    int wfd = g_watch_pipe[1];
+    pthread_mutex_unlock(&g_linux_watch_lock);
+
+    if (wfd >= 0) {
+        uint8_t b = 1;
+        ssize_t ignored = write(wfd, &b, 1);
+        (void)ignored;
+    }
+    pthread_join(th, NULL);
+
+    pthread_mutex_lock(&g_linux_watch_lock);
+    if (g_watch_pipe[0] >= 0) {
+        close(g_watch_pipe[0]);
+        g_watch_pipe[0] = -1;
+    }
+    if (g_watch_pipe[1] >= 0) {
+        close(g_watch_pipe[1]);
+        g_watch_pipe[1] = -1;
+    }
+    pthread_mutex_unlock(&g_linux_watch_lock);
 }
 
 int hidpp_plat_needs_notify_thread(void) {
@@ -124,80 +240,239 @@ int32_t hidpp_plat_started_hidden(void) {
     return 0;
 }
 
-/* Query org.freedesktop.DBus.NameHasOwner("org.kde.StatusNotifierWatcher")
- * via already-linked or dynamically opened libgio-2.0.so.0 (zero glib header coupling). */
-int32_t hidpp_plat_can_hide_to_tray(void) {
-    void *lib = dlopen("libgio-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
-    void *sym_src = lib ? lib : RTLD_DEFAULT;
+/* ---- D-Bus SNI tray availability & registration verification via libgio-2.0.so.0 ---- */
 
-    typedef void *(*fn_bus_get_sync)(int, void *, void **);
-    typedef void *(*fn_dbus_call_sync)(void *, const char *, const char *, const char *,
-                                       const char *, void *, const void *, int, int, void *, void **);
-    typedef void *(*fn_variant_new)(const char *, ...);
-    typedef void  (*fn_variant_get)(void *, const char *, ...);
-    typedef void  (*fn_variant_unref)(void *);
-    typedef void  (*fn_object_unref)(void *);
-    typedef void  (*fn_error_free)(void *);
+typedef void  *(*gio_bus_get_sync_fn)(int, void *, void **);
+typedef void  *(*gio_dbus_call_sync_fn)(void *, const char *, const char *, const char *,
+                                        const char *, void *, const void *, int, int, void *, void **);
+typedef void  *(*gio_var_new_fn)(const char *, ...);
+typedef void   (*gio_var_get_fn)(void *, const char *, ...);
+typedef int    (*gio_var_get_bool_fn)(void *);
+typedef size_t (*gio_var_n_children_fn)(void *);
+typedef void  *(*gio_var_get_child_fn)(void *, size_t);
+typedef const char *(*gio_var_get_str_fn)(void *, size_t *);
+typedef void   (*gio_var_unref_fn)(void *);
+typedef void   (*gio_obj_unref_fn)(void *);
+typedef void   (*gio_err_free_fn)(void *);
 
-    fn_bus_get_sync   p_bus_get   = NULL;
-    fn_dbus_call_sync p_dbus_call = NULL;
-    fn_variant_new    p_var_new   = NULL;
-    fn_variant_get    p_var_get   = NULL;
-    fn_variant_unref  p_var_unref = NULL;
-    fn_object_unref   p_obj_unref = NULL;
-    fn_error_free     p_err_free  = NULL;
+typedef struct gio_dbus_syms {
+    void                  *lib;
+    gio_bus_get_sync_fn    bus_get;
+    gio_dbus_call_sync_fn  dbus_call;
+    gio_var_new_fn         var_new;
+    gio_var_get_fn         var_get;
+    gio_var_get_bool_fn    var_get_bool;
+    gio_var_n_children_fn  var_n_children;
+    gio_var_get_child_fn   var_get_child;
+    gio_var_get_str_fn     var_get_str;
+    gio_var_unref_fn       var_unref;
+    gio_obj_unref_fn       obj_unref;
+    gio_err_free_fn        err_free;
+} gio_dbus_syms_t;
 
-    *(void **)(&p_bus_get)   = dlsym(sym_src, "g_bus_get_sync");
-    *(void **)(&p_dbus_call) = dlsym(sym_src, "g_dbus_connection_call_sync");
-    *(void **)(&p_var_new)   = dlsym(sym_src, "g_variant_new");
-    *(void **)(&p_var_get)   = dlsym(sym_src, "g_variant_get");
-    *(void **)(&p_var_unref) = dlsym(sym_src, "g_variant_unref");
-    *(void **)(&p_obj_unref) = dlsym(sym_src, "g_object_unref");
-    *(void **)(&p_err_free)  = dlsym(sym_src, "g_error_free");
+static int gio_dbus_load(gio_dbus_syms_t *g) {
+    memset(g, 0, sizeof(*g));
+    g->lib = dlopen("libgio-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
+    void *sym_src = g->lib ? g->lib : RTLD_DEFAULT;
 
-    if (!p_bus_get || !p_dbus_call || !p_var_new || !p_var_get ||
-        !p_var_unref || !p_obj_unref || !p_err_free) {
-        if (lib) dlclose(lib);
+    *(void **)(&g->bus_get)        = dlsym(sym_src, "g_bus_get_sync");
+    *(void **)(&g->dbus_call)      = dlsym(sym_src, "g_dbus_connection_call_sync");
+    *(void **)(&g->var_new)        = dlsym(sym_src, "g_variant_new");
+    *(void **)(&g->var_get)        = dlsym(sym_src, "g_variant_get");
+    *(void **)(&g->var_get_bool)   = dlsym(sym_src, "g_variant_get_boolean");
+    *(void **)(&g->var_n_children) = dlsym(sym_src, "g_variant_n_children");
+    *(void **)(&g->var_get_child)  = dlsym(sym_src, "g_variant_get_child_value");
+    *(void **)(&g->var_get_str)    = dlsym(sym_src, "g_variant_get_string");
+    *(void **)(&g->var_unref)      = dlsym(sym_src, "g_variant_unref");
+    *(void **)(&g->obj_unref)      = dlsym(sym_src, "g_object_unref");
+    *(void **)(&g->err_free)       = dlsym(sym_src, "g_error_free");
+
+    if (!g->bus_get || !g->dbus_call || !g->var_new || !g->var_get ||
+        !g->var_get_bool || !g->var_n_children || !g->var_get_child ||
+        !g->var_get_str || !g->var_unref || !g->obj_unref || !g->err_free) {
+        if (g->lib) {
+            dlclose(g->lib);
+            g->lib = NULL;
+        }
         return 0;
     }
+    return 1;
+}
+
+static void gio_dbus_unload(gio_dbus_syms_t *g) {
+    if (g->lib) {
+        dlclose(g->lib);
+        g->lib = NULL;
+    }
+}
+
+static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
+    void *err = NULL;
+    void *params = g->var_new("(s)", "org.kde.StatusNotifierWatcher");
+    void *reply = g->dbus_call(
+        conn,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        params,
+        NULL,
+        0,
+        500,
+        NULL,
+        &err);
+    if (err) {
+        g->err_free(err);
+        err = NULL;
+    }
+    int has_owner = 0;
+    if (reply) {
+        int b = 0;
+        g->var_get(reply, "(b)", &b);
+        has_owner = b ? 1 : 0;
+        g->var_unref(reply);
+    }
+    if (!has_owner) return 0;
+
+    void *prop_params = g->var_new(
+        "(ss)",
+        "org.kde.StatusNotifierWatcher",
+        "IsStatusNotifierHostRegistered");
+    void *prop_reply = g->dbus_call(
+        conn,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        prop_params,
+        NULL,
+        0,
+        500,
+        NULL,
+        &err);
+    if (err) {
+        g->err_free(err);
+        err = NULL;
+    }
+    int host_ok = 0;
+    if (prop_reply) {
+        void *inner = NULL;
+        g->var_get(prop_reply, "(v)", &inner);
+        if (inner) {
+            host_ok = g->var_get_bool(inner) ? 1 : 0;
+            g->var_unref(inner);
+        }
+        g->var_unref(prop_reply);
+    }
+    return host_ok;
+}
+
+int32_t hidpp_plat_can_hide_to_tray(void) {
+    gio_dbus_syms_t g;
+    if (!gio_dbus_load(&g)) return 0;
 
     int32_t has_tray = 0;
     void *err = NULL;
     /* G_BUS_TYPE_SESSION = 2 */
-    void *conn = p_bus_get(2, NULL, &err);
+    void *conn = g.bus_get(2, NULL, &err);
     if (err) {
-        p_err_free(err);
+        g.err_free(err);
         err = NULL;
     }
     if (conn) {
-        void *params = p_var_new("(s)", "org.kde.StatusNotifierWatcher");
-        void *reply = p_dbus_call(
+        has_tray = dbus_sni_host_registered(&g, conn) ? 1 : 0;
+        g.obj_unref(conn);
+    }
+    gio_dbus_unload(&g);
+    return has_tray;
+}
+
+int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
+    gio_dbus_syms_t g;
+    if (!gio_dbus_load(&g)) return 0;
+
+    void *err = NULL;
+    void *conn = g.bus_get(2, NULL, &err);
+    if (err) {
+        g.err_free(err);
+        err = NULL;
+    }
+    if (!conn) {
+        gio_dbus_unload(&g);
+        return 0;
+    }
+
+    if (!dbus_sni_host_registered(&g, conn)) {
+        g.obj_unref(conn);
+        gio_dbus_unload(&g);
+        return 0;
+    }
+
+    char needle[128];
+    snprintf(needle, sizeof(needle), "org.kde.StatusNotifierItem-%ld-1", (long)getpid());
+
+    uint64_t deadline = hidpp_plat_now_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
+    int32_t ready = 0;
+
+    for (;;) {
+        if (hidpp_core_is_stopping()) break;
+
+        void *params = g.var_new(
+            "(ss)",
+            "org.kde.StatusNotifierWatcher",
+            "RegisteredStatusNotifierItems");
+        void *reply = g.dbus_call(
             conn,
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "NameHasOwner",
+            "org.kde.StatusNotifierWatcher",
+            "/StatusNotifierWatcher",
+            "org.freedesktop.DBus.Properties",
+            "Get",
             params,
             NULL,
-            0,    /* G_DBUS_CALL_FLAGS_NONE */
-            500,  /* timeout ms */
+            0,
+            500,
             NULL,
             &err);
         if (err) {
-            p_err_free(err);
+            g.err_free(err);
             err = NULL;
         }
+        int found = 0;
         if (reply) {
-            int gbool_has_owner = 0;
-            p_var_get(reply, "(b)", &gbool_has_owner);
-            has_tray = gbool_has_owner ? 1 : 0;
-            p_var_unref(reply);
+            void *inner = NULL;
+            g.var_get(reply, "(v)", &inner);
+            if (inner) {
+                size_t n = g.var_n_children(inner);
+                for (size_t i = 0; i < n; i++) {
+                    void *child = g.var_get_child(inner, i);
+                    if (child) {
+                        const char *s = g.var_get_str(child, NULL);
+                        if (s && strstr(s, needle) != NULL) {
+                            found = 1;
+                        }
+                        g.var_unref(child);
+                    }
+                    if (found) break;
+                }
+                g.var_unref(inner);
+            }
+            g.var_unref(reply);
         }
-        p_obj_unref(conn);
+
+        if (found && dbus_sni_host_registered(&g, conn)) {
+            ready = 1;
+            break;
+        }
+
+        uint64_t now = hidpp_plat_now_ms();
+        if (now >= deadline) break;
+        uint64_t rem = deadline - now;
+        hidpp_plat_sleep_ms(rem > 50u ? 50u : (uint32_t)rem);
     }
 
-    if (lib) dlclose(lib);
-    return has_tray;
+    g.obj_unref(conn);
+    gio_dbus_unload(&g);
+    return ready;
 }
 
 /* ---- Dynamic /sys/class/hidraw scan + HID_PHYS dedup + Report Descriptor check ---- */
@@ -205,18 +480,22 @@ int32_t hidpp_plat_can_hide_to_tray(void) {
 typedef struct linux_cand {
     hidpp_endpoint_info_t info;
     char                  base_phys[256];
-    int                   is_dj_child; /* 1 if HID_PHYS ends with ":<digits>" */
+    char                  uniq[128];
+    int                   is_usb;
+    int                   is_dj_child; /* 1 if USB HID_PHYS ends with ":<digits>" */
 } linux_cand_t;
 
 static int parse_uevent(const char *hidraw_name, uint16_t *out_vid, uint16_t *out_pid,
-                        char *out_phys, size_t phys_cap) {
+                        char *out_phys, size_t phys_cap,
+                        char *out_uniq, size_t uniq_cap) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", hidraw_name);
     FILE *f = fopen(path, "r");
     if (!f) return 0;
 
     int got_id = 0;
-    out_phys[0] = '\0';
+    if (out_phys && phys_cap > 0) out_phys[0] = '\0';
+    if (out_uniq && uniq_cap > 0) out_uniq[0] = '\0';
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         size_t len = strlen(line);
@@ -231,8 +510,12 @@ static int parse_uevent(const char *hidraw_name, uint16_t *out_vid, uint16_t *ou
                 got_id = 1;
             }
         } else if (strncmp(line, "HID_PHYS=", 9) == 0) {
-            if (phys_cap > 0) {
+            if (out_phys && phys_cap > 0) {
                 snprintf(out_phys, phys_cap, "%.*s", (int)(phys_cap - 1), line + 9);
+            }
+        } else if (strncmp(line, "HID_UNIQ=", 9) == 0) {
+            if (out_uniq && uniq_cap > 0) {
+                snprintf(out_uniq, uniq_cap, "%.*s", (int)(uniq_cap - 1), line + 9);
             }
         }
     }
@@ -240,9 +523,13 @@ static int parse_uevent(const char *hidraw_name, uint16_t *out_vid, uint16_t *ou
     return got_id;
 }
 
-/* Strips trailing ":<digits>" from hid-logitech-dj child HID_PHYS (e.g. ".../input2:1"). */
+/* Strips trailing ":<digits>" ONLY from USB hid-logitech-dj child HID_PHYS (e.g. "usb-.../input2:1").
+ * Never treats Bluetooth MAC addresses (aa:bb:cc:dd:ee:ff) as DJ children. */
 static int extract_base_phys(const char *phys, char *base, size_t cap) {
     snprintf(base, cap, "%s", phys);
+    if (strncmp(phys, "usb-", 4) != 0) {
+        return 0;
+    }
     char *colon = strrchr(base, ':');
     if (colon && colon[1] != '\0') {
         int all_digits = 1;
@@ -260,7 +547,42 @@ static int extract_base_phys(const char *phys, char *base, size_t cap) {
     return 0;
 }
 
-static int probe_hidraw_rdesc(const char *dev_path, int *out_perm_denied) {
+static int probe_hidraw_rdesc(const char *hidraw_name, const char *dev_path, int *out_perm_denied) {
+    /* First read world-readable sysfs report_descriptor so non-HID++ endpoints never
+     * trigger false EACCES permission errors on /dev/hidrawX. */
+    char sys_path[PATH_MAX];
+    snprintf(sys_path, sizeof(sys_path), "/sys/class/hidraw/%s/device/report_descriptor", hidraw_name);
+    int sfd = open(sys_path, O_RDONLY | O_CLOEXEC);
+    if (sfd >= 0) {
+        uint8_t rbuf[HID_MAX_DESCRIPTOR_SIZE];
+        ssize_t n = read(sfd, rbuf, sizeof(rbuf));
+        close(sfd);
+        if (n <= 0) return 0;
+
+        hidpp_rdesc_caps_t caps;
+        hidpp_parse_report_descriptor(rbuf, (size_t)n, &caps);
+        if (!(caps.has_ff00 &&
+              caps.out_bytes_11 == HIDPP_LONG_LEN &&
+              caps.in_bytes_11 >= HIDPP_LONG_LEN)) {
+            return 0;
+        }
+
+        int fd = open(dev_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EACCES || errno == EPERM) {
+                if (out_perm_denied) *out_perm_denied = 1;
+            }
+            return 0;
+        }
+        close(fd);
+        return 1;
+    }
+
+    if (errno != ENOENT) {
+        return 0;
+    }
+
+    /* Fallback when sysfs report_descriptor is absent */
     int fd = open(dev_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         if (errno == EACCES || errno == EPERM) {
@@ -317,7 +639,8 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
 
         uint16_t vid = 0, pid = 0;
         char phys[256];
-        if (!parse_uevent(de->d_name, &vid, &pid, phys, sizeof(phys))) continue;
+        char uniq[128];
+        if (!parse_uevent(de->d_name, &vid, &pid, phys, sizeof(phys), uniq, sizeof(uniq))) continue;
         if (vid != HIDPP_VID_LOGITECH) continue;
 
         char dev_path[HIDPP_ENDPOINT_ID_MAX];
@@ -325,19 +648,23 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
         if (pn <= 0 || (size_t)pn >= sizeof(dev_path)) continue;
 
         int ep_perm = 0;
-        if (!probe_hidraw_rdesc(dev_path, &ep_perm)) {
+        if (!probe_hidraw_rdesc(de->d_name, dev_path, &ep_perm)) {
             if (ep_perm) perm_denied = 1;
             continue;
         }
 
         char base_phys[256];
+        int is_usb = (strncmp(phys, "usb-", 4) == 0) ? 1 : 0;
         int is_dj_child = extract_base_phys(phys, base_phys, sizeof(base_phys));
 
-        /* Deduplicate by base HID_PHYS, preferring physical receiver over hid-logitech-dj child. */
+        /* Only deduplicate USB hid-logitech-dj child vs parent receiver on the same base_phys.
+         * Never merge two Bluetooth devices or two independent non-DJ USB devices. */
         int dup_idx = -1;
-        if (base_phys[0] != '\0') {
+        if (is_usb && base_phys[0] != '\0') {
             for (int i = 0; i < ncand; i++) {
-                if (strcmp(cands[i].base_phys, base_phys) == 0) {
+                if (cands[i].is_usb &&
+                    (is_dj_child || cands[i].is_dj_child) &&
+                    strcmp(cands[i].base_phys, base_phys) == 0) {
                     dup_idx = i;
                     break;
                 }
@@ -351,6 +678,8 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
                 cands[dup_idx].info.vid = vid;
                 cands[dup_idx].info.pid = pid;
                 cands[dup_idx].info.kind = hidpp_classify_pid(pid);
+                memcpy(cands[dup_idx].uniq, uniq, sizeof(cands[dup_idx].uniq));
+                cands[dup_idx].uniq[sizeof(cands[dup_idx].uniq) - 1] = '\0';
                 cands[dup_idx].is_dj_child = 0;
             }
             continue;
@@ -366,6 +695,9 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
             c->info.kind = hidpp_classify_pid(pid);
             memcpy(c->base_phys, base_phys, sizeof(c->base_phys));
             c->base_phys[sizeof(c->base_phys) - 1] = '\0';
+            memcpy(c->uniq, uniq, sizeof(c->uniq));
+            c->uniq[sizeof(c->uniq) - 1] = '\0';
+            c->is_usb = is_usb;
             c->is_dj_child = is_dj_child;
         }
     }
@@ -513,6 +845,28 @@ int32_t hidpp_plat_get_autostart(void) {
     return (access(p, F_OK) == 0) ? 1 : 0;
 }
 
+static int escape_desktop_exec_arg(const char *src, char *dst, size_t cap) {
+    if (!src || !dst || cap == 0) return 0;
+    size_t pos = 0;
+    for (const char *p = src; *p; p++) {
+        char c = *p;
+        if (c == '%') {
+            if (pos + 2 >= cap) return 0;
+            dst[pos++] = '%';
+            dst[pos++] = '%';
+        } else if (c == '\\' || c == '"' || c == '`' || c == '$') {
+            if (pos + 2 >= cap) return 0;
+            dst[pos++] = '\\';
+            dst[pos++] = c;
+        } else {
+            if (pos + 1 >= cap) return 0;
+            dst[pos++] = c;
+        }
+    }
+    dst[pos] = '\0';
+    return 1;
+}
+
 int32_t hidpp_plat_set_autostart(int32_t enable) {
     hidpp_plat_init();
     char p[PATH_MAX];
@@ -532,6 +886,11 @@ int32_t hidpp_plat_set_autostart(int32_t enable) {
         (void)mkdir_p_dir(dir);
     }
 
+    char escaped_exe[PATH_MAX * 2];
+    if (!escape_desktop_exec_arg(g_exe_path, escaped_exe, sizeof(escaped_exe))) {
+        return hidpp_plat_get_autostart();
+    }
+
     char tmp[PATH_MAX + 32];
     int tn = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", p, (long)getpid());
     if (tn <= 0 || (size_t)tn >= sizeof(tmp)) return hidpp_plat_get_autostart();
@@ -544,7 +903,7 @@ int32_t hidpp_plat_set_autostart(int32_t enable) {
             "Name=MouseDPI\n"
             "Exec=\"%s\" --tray\n"
             "X-GNOME-Autostart-enabled=true\n",
-            g_exe_path) > 0;
+            escaped_exe) > 0;
         if (ok && fflush(f) != 0) ok = 0;
         if (fclose(f) != 0) ok = 0;
         if (ok) {

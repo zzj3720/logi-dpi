@@ -50,17 +50,44 @@ struct hidpp_dev {
     macos_slot_t *slot;
 };
 
+#define MACOS_DENIED_CAP 32
+
 static pthread_mutex_t g_slots_lock = PTHREAD_MUTEX_INITIALIZER;
 static macos_slot_t   *g_slots_head = NULL;
 static uint64_t        g_next_slot_id = 1;
-static int             g_macos_perm_denied = 0;
+static IOHIDDeviceRef  g_denied_devs[MACOS_DENIED_CAP];
+static int             g_denied_count = 0;
+static int             g_mgr_open_denied = 0;
 
 static pthread_mutex_t g_mgr_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_mgr_ready_cv = PTHREAD_COND_INITIALIZER;
 static int             g_mgr_started = 0;
 static int             g_mgr_ready = 0;
+static int             g_mgr_stopping = 0;
+static int             g_mgr_stopped = 0;
 static pthread_t       g_mgr_thread;
 static CFRunLoopRef    g_mgr_runloop = NULL;
+
+static void denied_add_locked(IOHIDDeviceRef device) {
+    if (!device) return;
+    for (int i = 0; i < g_denied_count; i++) {
+        if (g_denied_devs[i] == device) return;
+    }
+    if (g_denied_count < MACOS_DENIED_CAP) {
+        g_denied_devs[g_denied_count++] = device;
+    }
+}
+
+static void denied_remove_locked(IOHIDDeviceRef device) {
+    if (!device) return;
+    for (int i = 0; i < g_denied_count; i++) {
+        if (g_denied_devs[i] == device) {
+            g_denied_devs[i] = g_denied_devs[--g_denied_count];
+            g_denied_devs[g_denied_count] = NULL;
+            return;
+        }
+    }
+}
 
 static int             g_paths_inited = 0;
 static char            g_exe_path[PATH_MAX] = {0};
@@ -187,7 +214,7 @@ static void device_matched_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
     if (open_rc != kIOReturnSuccess) {
         if (open_rc == kIOReturnNotPermitted) {
             pthread_mutex_lock(&g_slots_lock);
-            g_macos_perm_denied = 1;
+            denied_add_locked(device);
             pthread_mutex_unlock(&g_slots_lock);
         }
         return;
@@ -218,6 +245,8 @@ static void device_matched_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
     pthread_cond_init(&slot->cv, NULL);
 
     pthread_mutex_lock(&g_slots_lock);
+    denied_remove_locked(device);
+    g_mgr_open_denied = 0;
     uint64_t sid = g_next_slot_id++;
     snprintf(slot->id, sizeof(slot->id), "iokit:%04x:%04x:%llu",
              (unsigned)vid, (unsigned)pid, (unsigned long long)sid);
@@ -228,18 +257,19 @@ static void device_matched_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
     IOHIDDeviceRegisterInputReportCallback(
         device, slot->cb_buf, (CFIndex)slot->cb_buf_len, input_report_cb, slot);
 
-    /* Hotplug after initial manager startup: trigger wake restore / refresh. */
+    /* Hotplug after initial manager startup: trigger topology change & restore/refresh. */
     pthread_mutex_lock(&g_mgr_lock);
     int ready = g_mgr_ready;
     pthread_mutex_unlock(&g_mgr_lock);
     if (ready) {
-        hidpp_core_signal_wake();
+        hidpp_core_signal_topology_change();
     }
 }
 
 static void destroy_slot(macos_slot_t *slot) {
     if (!slot) return;
-    IOHIDDeviceRegisterInputReportCallback(slot->device, slot->cb_buf, 0, NULL, NULL);
+    IOHIDDeviceRegisterInputReportCallback(
+        slot->device, slot->cb_buf, (CFIndex)slot->cb_buf_len, NULL, slot);
 
     pthread_mutex_lock(&slot->lock);
     slot->alive = 0;
@@ -265,6 +295,7 @@ static void device_removed_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
 
     macos_slot_t *removed = NULL;
     pthread_mutex_lock(&g_slots_lock);
+    denied_remove_locked(device);
     macos_slot_t **pp = &g_slots_head;
     while (*pp) {
         if ((*pp)->device == device) {
@@ -277,7 +308,10 @@ static void device_removed_cb(void *ctx, IOReturn res, void *sender, IOHIDDevice
     }
     pthread_mutex_unlock(&g_slots_lock);
 
-    destroy_slot(removed);
+    if (removed) {
+        destroy_slot(removed);
+        hidpp_core_signal_topology_change();
+    }
 }
 
 static void *hid_mgr_thread_main(void *unused) {
@@ -299,7 +333,7 @@ static void *hid_mgr_thread_main(void *unused) {
             IOReturn rc = IOHIDManagerOpen(mgr, kIOHIDOptionsTypeNone);
             if (rc == kIOReturnNotPermitted) {
                 pthread_mutex_lock(&g_slots_lock);
-                g_macos_perm_denied = 1;
+                g_mgr_open_denied = 1;
                 pthread_mutex_unlock(&g_slots_lock);
             }
 
@@ -309,10 +343,13 @@ static void *hid_mgr_thread_main(void *unused) {
             pthread_mutex_lock(&g_mgr_lock);
             g_mgr_runloop = (CFRunLoopRef)CFRetain(rl);
             g_mgr_ready = 1;
+            int should_run = !g_mgr_stopping;
             pthread_cond_broadcast(&g_mgr_ready_cv);
             pthread_mutex_unlock(&g_mgr_lock);
 
-            CFRunLoopRun();
+            if (should_run) {
+                CFRunLoopRun();
+            }
 
             IOHIDManagerUnscheduleFromRunLoop(mgr, rl, kCFRunLoopDefaultMode);
             IOHIDManagerClose(mgr, kIOHIDOptionsTypeNone);
@@ -330,6 +367,11 @@ static void *hid_mgr_thread_main(void *unused) {
                 if (!s) break;
                 destroy_slot(s);
             }
+
+            pthread_mutex_lock(&g_slots_lock);
+            g_denied_count = 0;
+            g_mgr_open_denied = 0;
+            pthread_mutex_unlock(&g_slots_lock);
 
             pthread_mutex_lock(&g_mgr_lock);
             if (g_mgr_runloop) {
@@ -349,6 +391,10 @@ static void *hid_mgr_thread_main(void *unused) {
 
 static void ensure_hid_mgr_started(void) {
     pthread_mutex_lock(&g_mgr_lock);
+    if (g_mgr_stopped || g_mgr_stopping || hidpp_core_is_stopping()) {
+        pthread_mutex_unlock(&g_mgr_lock);
+        return;
+    }
     if (!g_mgr_started) {
         g_mgr_started = 1;
         g_mgr_ready = 0;
@@ -374,12 +420,22 @@ void hidpp_plat_start_watchers(void) {
 
 void hidpp_plat_stop_watchers(void) {
     pthread_mutex_lock(&g_mgr_lock);
+    g_mgr_stopping = 1;
+    g_mgr_stopped = 1;
     int was_started = g_mgr_started;
+    if (was_started) {
+        while (!g_mgr_ready) {
+            pthread_cond_wait(&g_mgr_ready_cv, &g_mgr_lock);
+        }
+    }
     CFRunLoopRef rl = g_mgr_runloop ? (CFRunLoopRef)CFRetain(g_mgr_runloop) : NULL;
     pthread_mutex_unlock(&g_mgr_lock);
 
     if (rl) {
-        CFRunLoopStop(rl);
+        CFRunLoopPerformBlock(rl, kCFRunLoopCommonModes, ^{
+            CFRunLoopStop(rl);
+        });
+        CFRunLoopWakeUp(rl);
         CFRelease(rl);
     }
     if (was_started) {
@@ -406,21 +462,27 @@ static int cmp_endpoint_kind(const void *a, const void *b) {
 int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_perm_denied) {
     ensure_hid_mgr_started();
     int count = 0;
+    int alive_total = 0;
 
     pthread_mutex_lock(&g_slots_lock);
-    if (out_perm_denied) *out_perm_denied = g_macos_perm_denied;
-    for (macos_slot_t *s = g_slots_head; s && count < max_count; s = s->next) {
+    for (macos_slot_t *s = g_slots_head; s; s = s->next) {
         pthread_mutex_lock(&s->lock);
         int alive = s->alive;
         pthread_mutex_unlock(&s->lock);
         if (!alive) continue;
+        alive_total++;
 
-        hidpp_endpoint_info_t *ep = &out[count++];
-        memset(ep, 0, sizeof(*ep));
-        snprintf(ep->id, sizeof(ep->id), "%s", s->id);
-        ep->vid = s->vid;
-        ep->pid = s->pid;
-        ep->kind = s->kind;
+        if (count < max_count) {
+            hidpp_endpoint_info_t *ep = &out[count++];
+            memset(ep, 0, sizeof(*ep));
+            snprintf(ep->id, sizeof(ep->id), "%s", s->id);
+            ep->vid = s->vid;
+            ep->pid = s->pid;
+            ep->kind = s->kind;
+        }
+    }
+    if (out_perm_denied) {
+        *out_perm_denied = (alive_total == 0 && (g_denied_count > 0 || g_mgr_open_denied)) ? 1 : 0;
     }
     pthread_mutex_unlock(&g_slots_lock);
 
@@ -433,25 +495,26 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
 hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_perm_denied) {
     (void)notify_only;
     ensure_hid_mgr_started();
-    if (out_perm_denied) {
-        pthread_mutex_lock(&g_slots_lock);
-        *out_perm_denied = g_macos_perm_denied;
-        pthread_mutex_unlock(&g_slots_lock);
-    }
+    if (out_perm_denied) *out_perm_denied = 0;
     if (!endpoint_id || !endpoint_id[0]) return NULL;
 
     macos_slot_t *found = NULL;
+    int alive_total = 0;
     pthread_mutex_lock(&g_slots_lock);
     for (macos_slot_t *s = g_slots_head; s; s = s->next) {
-        if (strcmp(s->id, endpoint_id) == 0) {
-            pthread_mutex_lock(&s->lock);
-            if (s->alive) {
+        pthread_mutex_lock(&s->lock);
+        int alive = s->alive;
+        if (alive) {
+            alive_total++;
+            if (!found && strcmp(s->id, endpoint_id) == 0) {
                 s->in_flight++;
                 found = s;
             }
-            pthread_mutex_unlock(&s->lock);
-            break;
         }
+        pthread_mutex_unlock(&s->lock);
+    }
+    if (!found && out_perm_denied) {
+        *out_perm_denied = (alive_total == 0 && (g_denied_count > 0 || g_mgr_open_denied)) ? 1 : 0;
     }
     pthread_mutex_unlock(&g_slots_lock);
 
@@ -507,7 +570,7 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         device, kIOHIDReportTypeOutput, (CFIndex)buf[0], buf, (CFIndex)len);
     if (rc == kIOReturnNotPermitted) {
         pthread_mutex_lock(&g_slots_lock);
-        g_macos_perm_denied = 1;
+        denied_add_locked(device);
         pthread_mutex_unlock(&g_slots_lock);
         return -1;
     }
@@ -586,6 +649,11 @@ int32_t hidpp_plat_started_hidden(void) {
 }
 
 int32_t hidpp_plat_can_hide_to_tray(void) {
+    return 1;
+}
+
+int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
+    (void)timeout_ms;
     return 1;
 }
 
