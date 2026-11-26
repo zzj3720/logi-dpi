@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PION_REV: 585688d11b
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static Liquid Glass gate
+        run: '! grep -rn "Glass::liquid" pion/'
+
+      - name: Fetch pinned invar
+        run: sh tools/deps.sh
+
+      - name: Bootstrap Pion toolchain
+        run: |
+          git clone --filter=blob:none https://github.com/AFK-surf/pion.git _pion
+          git -C _pion checkout "$PION_REV"
+          (cd _pion && sh scripts/bootstrap.sh)
+          echo "PIONC=$PWD/_pion/out/pionc2" >> "$GITHUB_ENV"
+          echo "PION_QBE=$PWD/_pion/out/qbe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=$PWD/_pion/out/libpionrt.a" >> "$GITHUB_ENV"
+
+      - name: Check workspace & run dpi_ui unit tests
+        run: |
+          "$PIONC" check --json
+          "$PIONC" test --json pion/packages/dpi_ui
+
+      - name: Run hidpp_core C unit tests
+        run: |
+          mkdir -p out
+          if grep -q '#include.*"hidpp_core.c"' pion/cmd/mousedpi/hidpp_core_test.c; then
+            cc -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
+          else
+            cc -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core.c pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
+          fi
+          ./out/hidpp_core_test
+
+      - name: Build macOS app bundle
+        run: |
+          sh tools/build-macos.sh
+          test -x out/MouseDPI
+          test -x out/MouseDPI.app/Contents/MacOS/MouseDPI
+          test -f out/MouseDPI.app/Contents/Info.plist
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static Liquid Glass gate
+        run: '! grep -rn "Glass::liquid" pion/'
+
+      - name: Install Linux host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libsoup-3.0-dev libepoxy-dev pkg-config
+
+      - name: Fetch pinned invar
+        run: sh tools/deps.sh
+
+      - name: Bootstrap Pion toolchain
+        run: |
+          git clone --filter=blob:none https://github.com/AFK-surf/pion.git _pion
+          git -C _pion checkout "$PION_REV"
+          (cd _pion && sh scripts/bootstrap.sh)
+          echo "PIONC=$PWD/_pion/out/pionc2" >> "$GITHUB_ENV"
+          echo "PION_QBE=$PWD/_pion/out/qbe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=$PWD/_pion/out/libpionrt.a" >> "$GITHUB_ENV"
+
+      - name: Check workspace & run dpi_ui unit tests
+        run: |
+          "$PIONC" check --json
+          "$PIONC" test --json pion/packages/dpi_ui
+
+      - name: Run hidpp_core C unit tests
+        run: |
+          mkdir -p out
+          if grep -q '#include.*"hidpp_core.c"' pion/cmd/mousedpi/hidpp_core_test.c; then
+            cc -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
+          else
+            cc -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core.c pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
+          fi
+          ./out/hidpp_core_test
+
+      - name: Build Linux binary
+        run: |
+          sh tools/build-linux.sh
+          test -x out/mousedpi
+
+      - name: Shell script syntax check
+        run: sh -n tools/deps.sh tools/build-macos.sh tools/build-linux.sh tools/install-linux.sh tools/build-win.sh
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static Liquid Glass gate
+        run: '! grep -rn "Glass::liquid" pion/'
+
+      - name: Fetch pinned invar & WebView2
+        run: sh tools/deps.sh
+
+      - name: Bootstrap Pion toolchain (Windows)
+        run: |
+          git clone --filter=blob:none https://github.com/AFK-surf/pion.git _pion
+          git -C _pion checkout "$PION_REV"
+          (cd _pion && sh scripts/bootstrap.sh)
+          echo "PIONC=$PWD/_pion/out/pionc2.exe" >> "$GITHUB_ENV"
+          echo "PION_QBE=$PWD/_pion/out/qbe.exe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=$PWD/_pion/out/libpionrt.a" >> "$GITHUB_ENV"
+          echo "PION_SRC=$PWD/_pion" >> "$GITHUB_ENV"
+
+      - name: Check workspace & run dpi_ui unit tests
+        run: |
+          "$PIONC" check --json
+          "$PIONC" test --json pion/packages/dpi_ui
+
+      - name: Run hidpp_core C unit tests
+        run: |
+          mkdir -p out
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          if grep -q '#include.*"hidpp_core.c"' pion/cmd/mousedpi/hidpp_core_test.c; then
+            "$LLVM_BIN/clang.exe" -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test.exe
+          else
+            "$LLVM_BIN/clang.exe" -std=c11 -O2 -Wall -Wextra -I pion/cmd/mousedpi pion/cmd/mousedpi/hidpp_core.c pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test.exe
+          fi
+          ./out/hidpp_core_test.exe
+
+      - name: Build Windows binary
+        run: |
+          LLVM_BIN="/c/Program Files/LLVM/bin" sh tools/build-win.sh
+          test -f out/MouseDPI.exe

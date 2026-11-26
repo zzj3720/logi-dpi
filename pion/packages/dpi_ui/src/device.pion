@@ -1,36 +1,43 @@
-// What the window asks of the mouse (`Cmd`) and what comes back (`Ev`), through a `ui::Worker`: on Windows the worker
-// is a thread of its own over the HID++ side (pion/cmd/mousedpi), in tests and offscreen shots `Worker::inline` over
-// `stand_in`. Both are immutable enums, so they are `Send`.
+// What the window asks of the mouse (`Cmd`) and what comes back (`Ev`), through a `ui::Worker`: on desktop hosts
+// the worker is a thread of its own over the HID++ 2.0 core (pion/cmd/mousedpi), in tests and offscreen shots
+// `Worker::inline` over `stand_in`. Both are immutable enums, so they are `Send`.
 
 /// What the window asks.
 pub enum Cmd {
-  /// Read the mouse again (DPI, LOD, battery).
+  /// Read the mouse again (DPI, LOD, battery, device name).
   Refresh
+  /// Restore saved DPI/LOD after system wake or long inactivity, then refresh state.
+  WakeRestore
   /// Write DPI (both axes) and lift-off distance (1 low, 2 medium, 3 high).
   Set(Int, Int)
-  /// Start with Windows (put away to the tray) or not.
+  /// Start with the system (put away to the tray when available) or not.
   Autostart(Bool)
 }
 
 /// What comes back.
 pub enum Ev {
-  /// A read of the mouse: whether the receiver answered, DPI, LOD, battery percent (-1 unknown).
-  Read(Bool, Int, Int, Int)
-  /// Whether it starts with Windows now.
+  /// A read of the mouse: (connected, dpi, lod, battery percent [-1 unknown], perm_denied, device_name).
+  Read(Bool, Int, Int, Int, Bool, String)
+  /// Whether it starts with the system now.
   Autostarts(Bool)
 }
 
 /// A mouse that is not there: what the shots and the tests run on (each ask answered at once, as a mouse would).
-pub fn stand_in(battery : Int) -> (Cmd, (Ev) -> Unit) -> Unit {
+pub fn stand_in(
+  battery : Int,
+  device_name~ : String = "PRO X2 SUPERSTRIKE",
+  perm_denied~ : Bool = false,
+) -> (Cmd, (Ev) -> Unit) -> Unit {
   let dpi : Array[Int] = [800]
   let lod : Array[Int] = [2]
   fn(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
     match cmd {
-      Cmd::Refresh => emit(Ev::Read(true, dpi[0], lod[0], battery))
+      Cmd::Refresh => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name))
+      Cmd::WakeRestore => emit(Ev::Read(!perm_denied, dpi[0], lod[0], if perm_denied { -1 } else { battery }, perm_denied, device_name))
       Cmd::Set(d, l) => {
         dpi[0] = d
         lod[0] = l
-        emit(Ev::Read(true, d, l, battery))
+        emit(Ev::Read(!perm_denied, d, l, if perm_denied { -1 } else { battery }, perm_denied, device_name))
       }
       Cmd::Autostart(on) => emit(Ev::Autostarts(on))
     }

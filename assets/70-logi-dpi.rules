@@ -1,0 +1,3 @@
+# Grant local active desktop users access to Logitech USB HID++ (hidraw) devices.
+# Numbered 70 (< 73) so TAG+="uaccess" is applied before systemd's 73-seat-late.rules.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="uaccess"
