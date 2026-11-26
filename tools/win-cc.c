@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : exe, sizeof exe - (size_t)(slash ? slash + 1 - exe : 0), "clang++.exe");
   }
-  const char **out = (const char **)calloc((size_t)argc * 2 + 12, sizeof(char *));
+  const char **out = (const char **)calloc((size_t)argc * 2 + 16, sizeof(char *));
   int k = 0, compile_only = 0;
   out[k++] = exe;
   for (int i = 1; i < argc; i++) {
@@ -84,7 +84,13 @@ int main(int argc, char **argv) {
     }
     out[k++] = a;
   }
-  if (!compile_only) out[k++] = "-fuse-ld=lld";
+  if (compile_only) {
+    // Visual Studio 18+ STL headers emit STL1000 when paired with LLVM clang < 22 unless opted in.
+    out[k++] = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH";
+    out[k++] = "-D_CRT_SECURE_NO_WARNINGS";
+  } else {
+    out[k++] = "-fuse-ld=lld";
+  }
   // WIN_CC_DEBUG=1: CodeView debug info and a PDB beside the program (stacks in a debugger)
   if (getenv("WIN_CC_DEBUG")) {
     out[k++] = "-g";

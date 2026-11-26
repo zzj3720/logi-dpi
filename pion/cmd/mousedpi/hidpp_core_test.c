@@ -2035,11 +2035,16 @@ static void test_single_target_write_no_spillover_to_second_mouse(void) {
     assert(tok_b > tok_a);
     assert(mousedpi_snap_dpi_x() == 1200);
 
-    /* Now delayed worker submits UI's Set bound to stale tok_a */
+    /* Now delayed worker submits UI's Set bound to stale tok_a; loop wait_rev until seq=12
+     * is applied so a concurrent wake_worker rev bump from topology_change cannot race it. */
+    int32_t rev_cur = mousedpi_state_rev();
     mousedpi_request_set_target(12, tok_a, 3000, 3);
-    int32_t rev_sw2 = mousedpi_wait_rev(rev_sw1);
-    assert(rev_sw2 > rev_sw1);
-    mousedpi_snapshot_capture();
+    for (int tries = 0; tries < 8; tries++) {
+        rev_cur = mousedpi_wait_rev(rev_cur);
+        assert(rev_cur >= 0);
+        mousedpi_snapshot_capture();
+        if (mousedpi_snap_applied_seq() == 12) break;
+    }
     assert(mousedpi_snap_applied_seq() == 12);
     assert(mousedpi_snap_dpi_x() == 1200);
     assert(b->fn6_writes == 0);
