@@ -415,3 +415,80 @@ test "macos 640x340 minimum size with 63-byte device name and low-battery or per
   }
   lg::set_dark(None)
 }
+
+test "target switch cancels pending optimistic state from previous mouse before combining DPI/LOD" {
+  lg::set_dark(Some(true))
+  let m = Mouse::new()
+  m.connected.set(true)
+  m.dpi.set(800)
+  m.lod.set(2)
+  let sets : Array[(Int, Int, Int, Int)] = []
+  let worker = ui::Worker::inline(fn(cmd : Cmd, _emit : (Ev) -> Unit) -> Unit {
+    match cmd {
+      Cmd::Set(seq, tok, d, l) => sets.push((seq, tok, d, l))
+      _ => ()
+    }
+  })
+  let reads : ui::EventQueue[Ev] = ui::EventQueue::new()
+  let t = window(m, worker, [], reads=reads)
+  t.frame()
+
+  // Seed Mouse A (token=7, 800 DPI, LOD 2).
+  reads.emit(Ev::Read(true, 800, 2, 80, false, "Mouse A", 0, 7))
+  t.frame(ms=16.0)
+
+  // User sets DPI=1600 on Mouse A; write is still queued/unconfirmed (pending_seq=1, pending_token=7).
+  t.press("1600")
+  t.frame(ms=16.0)
+  debug_assert(sets.length() == 1, "expected 1 Set command for Mouse A")
+  let (s1_seq, s1_tok, s1_dpi, s1_lod) = sets[0]
+  debug_assert(s1_seq == 1 && s1_tok == 7 && s1_dpi == 1600 && s1_lod == 2, "expected Set(1, 7, 1600, 2)")
+  debug_assert(m.dpi.untracked() == 1600, "optimistic DPI 1600 on Mouse A")
+
+  // Mouse B connects and delivers its first snapshot with an OLD applied_seq=0 (< pending_seq=1).
+  reads.emit(Ev::Read(true, 1200, 1, 90, false, "Mouse B", 0, 8))
+  t.frame(ms=16.0)
+  debug_assert(m.device_name.untracked() == "Mouse B", "UI switched to Mouse B")
+  debug_assert(m.dpi.untracked() == 1200, "target switch must immediately adopt Mouse B's 1200 DPI, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 1, "target switch must immediately adopt Mouse B's LOD 1, got \{m.lod.untracked()}")
+
+  // User changes ONLY LOD on Mouse B ("高" = LOD 3): DPI sent to B MUST remain B's 1200 (never A's 1600).
+  t.press("高")
+  t.frame(ms=16.0)
+  debug_assert(sets.length() == 2, "expected 2 Set commands")
+  let (s2_seq, s2_tok, s2_dpi, s2_lod) = sets[1]
+  debug_assert(
+    s2_seq == 2 && s2_tok == 8 && s2_dpi == 1200 && s2_lod == 3,
+    "expected Set(2, 8, 1200, 3) on Mouse B, got (\{s2_seq}, \{s2_tok}, \{s2_dpi}, \{s2_lod})",
+  )
+
+  // Reverse direction: while B's LOD 3 write (seq=2) is still unconfirmed, Mouse C connects with old applied_seq=1.
+  reads.emit(Ev::Read(true, 2000, 1, 65, false, "Mouse C", 1, 9))
+  t.frame(ms=16.0)
+  debug_assert(m.device_name.untracked() == "Mouse C", "UI switched to Mouse C")
+  debug_assert(m.dpi.untracked() == 2000 && m.lod.untracked() == 1, "target switch must immediately adopt Mouse C's 2000/1")
+
+  // User changes ONLY DPI on Mouse C (3200): LOD sent to C MUST remain C's 1 (never B's 3).
+  t.press("3200")
+  t.frame(ms=16.0)
+  debug_assert(sets.length() == 3, "expected 3 Set commands")
+  let (s3_seq, s3_tok, s3_dpi, s3_lod) = sets[2]
+  debug_assert(
+    s3_seq == 3 && s3_tok == 9 && s3_dpi == 3200 && s3_lod == 1,
+    "expected Set(3, 9, 3200, 1) on Mouse C, got (\{s3_seq}, \{s3_tok}, \{s3_dpi}, \{s3_lod})",
+  )
+
+  // Stale applied_seq=2 for Mouse C (e.g. from rejecting B's stale seq=2) must NOT clobber C's pending seq=3.
+  reads.emit(Ev::Read(true, 2000, 1, 65, false, "Mouse C", 2, 9))
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 3200, "stale seq=2 on Mouse C must keep pending 3200 DPI, got \{m.dpi.untracked()}")
+
+  // Confirmation seq=3 on Mouse C applies cleanly.
+  reads.emit(Ev::Read(true, 3200, 1, 64, false, "Mouse C", 3, 9))
+  t.frame(ms=16.0)
+  debug_assert(m.dpi.untracked() == 3200 && m.lod.untracked() == 1 && m.battery.untracked() == 64, "confirmed seq=3 on Mouse C")
+
+  worker.close()
+  t.dispose()
+  lg::set_dark(None)
+}

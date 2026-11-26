@@ -51,25 +51,44 @@ fn ink_tertiary() -> Int64 {
   lg::surface().ink_tertiary
 }
 
-/// The worker's events into `m` (bound before every frame; `pending_seq[0]` is the latest requested write sequence,
-/// and `active_token[0]` is the atomic device target token carried by the latest snapshot).
-fn take(m : Mouse, pending_seq : Array[Int], active_token : Array[Int], ev : Ev) -> Unit {
+/// The worker's events into `m` (bound before every frame; `pending_seq[0]` and `pending_token[0]` track the in-flight
+/// optimistic write for one target device, and `active_token[0]` is the atomic device target token of the latest snapshot).
+fn take(
+  m : Mouse,
+  pending_seq : Array[Int],
+  pending_token : Array[Int],
+  active_token : Array[Int],
+  ev : Ev,
+) -> Unit {
   match ev {
     Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq, target_token) => {
+      let target_changed = target_token != active_token[0]
+      let had_pending = pending_seq[0] > 0
       active_token[0] = target_token
+      if target_changed || (had_pending && pending_token[0] != target_token) {
+        // Target switched: drop any unconfirmed optimistic state from the previous device immediately
+        // so its DPI/LOD can never be combined with the new device's target_token.
+        pending_seq[0] = 0
+        pending_token[0] = 0
+      }
       m.connected.set(ok)
       m.perm_denied.set(perm_denied)
       if device_name != "" {
         m.device_name.set(device_name)
       }
-      if applied_seq >= pending_seq[0] {
+      let accept = pending_seq[0] == 0 || applied_seq >= pending_seq[0]
+      if accept {
+        if pending_seq[0] > 0 && applied_seq >= pending_seq[0] {
+          pending_seq[0] = 0
+          pending_token[0] = 0
+        }
         if ok {
           m.dpi.set(dpi)
           m.lod.set(lod)
-        } else if pending_seq[0] > 0 {
-          // Offline snapshot after a failed user write still carries the last confirmed device values
+        } else if had_pending {
+          // Offline snapshot after a failed or cancelled user write still carries the last confirmed device values
           // (device range starts at 100 DPI, below the 200 DPI slider floor): undo the optimistic values
-          // without clobbering config-seeded DPI on an offline startup (where pending_seq == 0).
+          // without clobbering config-seeded DPI on an offline startup (where had_pending is false).
           if dpi >= 100 {
             m.dpi.set(dpi)
           }
@@ -270,21 +289,27 @@ pub fn app(
   close_label~ : String = "关闭到托盘",
   perm_hint~ : String = "请安装 udev 规则或在系统设置中授予权限",
 ) -> Unit {
+  let next_seq : Array[Int] = [0]
   let pending_seq : Array[Int] = [0]
+  let pending_token : Array[Int] = [0]
   let active_token : Array[Int] = [0]
-  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, active_token, ev) })
+  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, pending_token, active_token, ev) })
   // reads the device side does on its own (a thread that waits on them), taken as the worker's are
   match reads {
     Some(q) => {
-      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, active_token, ev) }) })
+      let _ = ui::on_before_frame(fn() {
+        let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, pending_token, active_token, ev) })
+      })
     }
     None => ()
   }
   // shown at once; written by the worker with a monotonic sequence number and the UI-seen device target token
-  // so stale reads are ignored, cross-device spillover is impossible, and real readbacks apply immediately.
+  // so stale reads are ignored, target switches cancel previous optimistic state, and real readbacks apply immediately.
   let ask = fn(dpi : Int, lod : Int) -> Unit {
-    let seq = pending_seq[0] + 1
+    let seq = next_seq[0] + 1
+    next_seq[0] = seq
     pending_seq[0] = seq
+    pending_token[0] = active_token[0]
     m.dpi.set(dpi)
     m.lod.set(lod)
     let _ = worker.send(Cmd::Set(seq, active_token[0], dpi, lod))

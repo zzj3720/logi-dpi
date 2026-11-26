@@ -150,11 +150,6 @@ fn main(world : World) -> Int {
   m.autostart.set(c_autostart() != 0)
   let (worker, ctx) : (ui::Worker[dpi_ui::Cmd, dpi_ui::Ev], ui::WorkerCtx[dpi_ui::Cmd, dpi_ui::Ev]) = ui::Worker::pair()
   let reads : ui::EventQueue[dpi_ui::Ev] = ui::EventQueue::new()
-  // Between-frame message channel for revealing a startup-hidden Linux window when SNI registration fails
-  // or the tray watcher disappears: delivered on the GLib main loop even while no window frame ticks.
-  ui::on_message("mousedpi.tray", fn(_json : String, _bytes : Option[Bytes]) -> Unit {
-    hostapi::window_show()
-  })
   // Register system lifecycle listener before ui::run so Shown/wake events are never missed.
   ui::on_message(hostapi::system_channel, fn(json : String, _bytes : Option[Bytes]) -> Unit {
     for said in hostapi::system_said(json) {
@@ -178,10 +173,10 @@ fn main(world : World) -> Int {
       spawn(s, fn() -> Unit {
         let ready = c_wait_tray_ready(1500) != 0
         if !ready {
-          // Startup SNI registration failed or timed out: reveal the hidden window via between-frame post.
+          // Startup SNI registration failed or timed out: schedule window show on the GTK/GLib main loop.
           c_notify_tray_show()
         } else {
-          // Confirmed registered: stay watching and reveal via between-frame post if tray definitely disappears.
+          // Confirmed registered: stay watching and schedule window show on the GTK/GLib main loop if tray disappears.
           if c_wait_tray_ready(-1) == 0 {
             c_notify_tray_show()
           }

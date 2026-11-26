@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "hidpp_platform.h"
 
 #include <ctype.h>
@@ -19,7 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef HIDPP_CORE_TEST
+#if !defined(HIDPP_CORE_TEST) && !defined(HIDPP_LINUX_TRAY_TEST)
 __attribute__((constructor(101)))
 static void mousedpi_linux_default_env(void) {
     const char *no_id = getenv("DPI_NO_APP_ID");
@@ -278,6 +280,49 @@ typedef struct gio_dbus_syms {
     gio_err_free_fn        err_free;
 } gio_dbus_syms_t;
 
+#ifdef HIDPP_LINUX_TRAY_TEST
+extern int hidpp_linux_test_sni_host(void);
+extern int hidpp_linux_test_sni_item(const char *needle);
+
+static void *test_bus_get_sync(int bus_type, void *cancellable, void **err) {
+    (void)bus_type;
+    (void)cancellable;
+    if (err) *err = NULL;
+    return (void *)(uintptr_t)1u;
+}
+
+static void test_obj_unref(void *obj) {
+    (void)obj;
+}
+
+static void test_err_free(void *err) {
+    (void)err;
+}
+
+static int gio_dbus_load(gio_dbus_syms_t *g) {
+    memset(g, 0, sizeof(*g));
+    g->bus_get   = test_bus_get_sync;
+    g->obj_unref = test_obj_unref;
+    g->err_free  = test_err_free;
+    return 1;
+}
+
+static void gio_dbus_unload(gio_dbus_syms_t *g) {
+    (void)g;
+}
+
+static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
+    (void)g;
+    (void)conn;
+    return hidpp_linux_test_sni_host();
+}
+
+static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const char *needle) {
+    (void)g;
+    (void)conn;
+    return hidpp_linux_test_sni_item(needle);
+}
+#else
 static int gio_dbus_load(gio_dbus_syms_t *g) {
     memset(g, 0, sizeof(*g));
     g->lib = dlopen("libgio-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
@@ -380,6 +425,7 @@ static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
     g->var_unref(prop_reply);
     return host_ok;
 }
+#endif
 
 int32_t hidpp_plat_can_hide_to_tray(void) {
     gio_dbus_syms_t g;
@@ -401,6 +447,7 @@ int32_t hidpp_plat_can_hide_to_tray(void) {
     return has_tray;
 }
 
+#ifndef HIDPP_LINUX_TRAY_TEST
 /* Tri-state SNI item probe: 1 = registered, 0 = definitely absent, -1 = transient D-Bus error/timeout. */
 static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const char *needle) {
     void *err = NULL;
@@ -451,6 +498,7 @@ static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const 
     g->var_unref(reply);
     return found;
 }
+#endif
 
 int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     gio_dbus_syms_t g;
@@ -488,9 +536,13 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
                     break;
                 }
             }
+#ifdef HIDPP_LINUX_TRAY_TEST
+            hidpp_plat_sleep_ms(10u);
+#else
             for (int i = 0; i < 100 && !hidpp_core_is_stopping(); i++) {
                 hidpp_plat_sleep_ms(50u);
             }
+#endif
         }
         g.obj_unref(conn);
         gio_dbus_unload(&g);
@@ -527,16 +579,41 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
 }
 
 #ifndef HIDPP_CORE_TEST
-/* Invar host between-frame message delivery (post.h): runs on GLib main loop even while window is hidden. */
-extern void mb_post(const char *channel, const char *json, size_t len, const uint8_t *bytes, size_t blen)
-    __attribute__((weak));
+/* Invar Linux host window reveal (linux_app.c): invoked directly on the GTK/GLib main thread
+ * via g_idle_add so a startup-hidden window (with zero GTK snapshots/frames and even with
+ * ordinary Invar messages already queued) reveals immediately. */
+extern void mb_host_window_show(void) __attribute__((weak));
+
+typedef int (*glib_source_func_t)(void *data);
+typedef unsigned int (*glib_idle_add_fn)(glib_source_func_t fn, void *data);
+
+static int linux_tray_show_idle_cb(void *unused) {
+    (void)unused;
+    if (!hidpp_core_is_stopping() && mb_host_window_show) {
+        mb_host_window_show();
+    }
+    return 0; /* G_SOURCE_REMOVE */
+}
 #endif
 
 void hidpp_plat_notify_tray_show(void) {
 #ifndef HIDPP_CORE_TEST
-    if (mb_post) {
-        static const char msg[] = "{\"show\":true}";
-        mb_post("mousedpi.tray", msg, sizeof(msg) - 1, NULL, 0);
+    if (hidpp_core_is_stopping() || !mb_host_window_show) return;
+    void *sym = dlsym(RTLD_DEFAULT, "g_idle_add");
+    void *glib = NULL;
+    if (!sym) {
+        glib = dlopen("libglib-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+        if (glib) {
+            sym = dlsym(glib, "g_idle_add");
+        }
+    }
+    if (sym) {
+        glib_idle_add_fn idle_add = NULL;
+        memcpy(&idle_add, &sym, sizeof(idle_add));
+        (void)idle_add(linux_tray_show_idle_cb, NULL);
+    }
+    if (glib) {
+        dlclose(glib);
     }
 #endif
 }

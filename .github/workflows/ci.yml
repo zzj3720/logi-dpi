@@ -182,6 +182,15 @@ jobs:
             pion/cmd/mousedpi/hidpp_core_test.c -o out/hidpp_core_test -pthread
           ./out/hidpp_core_test
 
+      - name: Run Linux tray GLib idle recovery tests (ASan + UBSan)
+        run: |
+          mkdir -p out
+          cc -std=c11 -g -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -DHIDPP_LINUX_TRAY_TEST -I pion/cmd/mousedpi \
+            $(pkg-config --cflags glib-2.0) \
+            pion/cmd/mousedpi/hidpp_linux_tray_test.c pion/cmd/mousedpi/hidpp_core.c -o out/hidpp_linux_tray_test \
+            $(pkg-config --libs glib-2.0) -pthread -ldl
+          ./out/hidpp_linux_tray_test
+
       - name: Compile-check C backend sources
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -c pion/cmd/mousedpi/hidpp_core.c -o /tmp/c.o
