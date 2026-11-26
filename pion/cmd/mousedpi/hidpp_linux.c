@@ -315,6 +315,10 @@ static void gio_dbus_unload(gio_dbus_syms_t *g) {
     }
 }
 
+/* Tri-state SNI host probe:
+ *   1 = watcher owned and IsStatusNotifierHostRegistered == true
+ *   0 = definite negative (no watcher owner or IsStatusNotifierHostRegistered == false)
+ *  -1 = transient D-Bus error / timeout (status unknown; do not treat as disappearance) */
 static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
     void *err = NULL;
     void *params = g->var_new("(s)", "org.kde.StatusNotifierWatcher");
@@ -334,14 +338,12 @@ static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
         g->err_free(err);
         err = NULL;
     }
-    int has_owner = 0;
-    if (reply) {
-        int b = 0;
-        g->var_get(reply, "(b)", &b);
-        has_owner = b ? 1 : 0;
-        g->var_unref(reply);
-    }
-    if (!has_owner) return 0;
+    if (!reply) return -1;
+
+    int b = 0;
+    g->var_get(reply, "(b)", &b);
+    g->var_unref(reply);
+    if (!b) return 0;
 
     void *prop_params = g->var_new(
         "(ss)",
@@ -363,19 +365,19 @@ static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
         g->err_free(err);
         err = NULL;
     }
-    int host_ok = 0;
-    if (prop_reply) {
-        void *inner = NULL;
-        g->var_get(prop_reply, "(v)", &inner);
-        if (inner) {
-            const char *ts = g->var_type_str(inner);
-            if (ts && strcmp(ts, "b") == 0) {
-                host_ok = g->var_get_bool(inner) ? 1 : 0;
-            }
-            g->var_unref(inner);
+    if (!prop_reply) return -1;
+
+    int host_ok = -1;
+    void *inner = NULL;
+    g->var_get(prop_reply, "(v)", &inner);
+    if (inner) {
+        const char *ts = g->var_type_str(inner);
+        if (ts && strcmp(ts, "b") == 0) {
+            host_ok = g->var_get_bool(inner) ? 1 : 0;
         }
-        g->var_unref(prop_reply);
+        g->var_unref(inner);
     }
+    g->var_unref(prop_reply);
     return host_ok;
 }
 
@@ -392,13 +394,14 @@ int32_t hidpp_plat_can_hide_to_tray(void) {
         err = NULL;
     }
     if (conn) {
-        has_tray = dbus_sni_host_registered(&g, conn) ? 1 : 0;
+        has_tray = (dbus_sni_host_registered(&g, conn) == 1) ? 1 : 0;
         g.obj_unref(conn);
     }
     gio_dbus_unload(&g);
     return has_tray;
 }
 
+/* Tri-state SNI item probe: 1 = registered, 0 = definitely absent, -1 = transient D-Bus error/timeout. */
 static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const char *needle) {
     void *err = NULL;
     void *params = g->var_new(
@@ -421,30 +424,31 @@ static int dbus_sni_item_registered(const gio_dbus_syms_t *g, void *conn, const 
         g->err_free(err);
         err = NULL;
     }
-    int found = 0;
-    if (reply) {
-        void *inner = NULL;
-        g->var_get(reply, "(v)", &inner);
-        if (inner) {
-            const char *ts = g->var_type_str(inner);
-            if (ts && strcmp(ts, "as") == 0) {
-                size_t n = g->var_n_children(inner);
-                for (size_t i = 0; i < n; i++) {
-                    void *child = g->var_get_child(inner, i);
-                    if (child) {
-                        const char *s = g->var_get_str(child, NULL);
-                        if (s && strstr(s, needle) != NULL) {
-                            found = 1;
-                        }
-                        g->var_unref(child);
+    if (!reply) return -1;
+
+    int found = -1;
+    void *inner = NULL;
+    g->var_get(reply, "(v)", &inner);
+    if (inner) {
+        const char *ts = g->var_type_str(inner);
+        if (ts && strcmp(ts, "as") == 0) {
+            found = 0;
+            size_t n = g->var_n_children(inner);
+            for (size_t i = 0; i < n; i++) {
+                void *child = g->var_get_child(inner, i);
+                if (child) {
+                    const char *s = g->var_get_str(child, NULL);
+                    if (s && strstr(s, needle) != NULL) {
+                        found = 1;
                     }
-                    if (found) break;
+                    g->var_unref(child);
                 }
+                if (found == 1) break;
             }
-            g->var_unref(inner);
         }
-        g->var_unref(reply);
+        g->var_unref(inner);
     }
+    g->var_unref(reply);
     return found;
 }
 
@@ -466,18 +470,25 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     char needle[128];
     snprintf(needle, sizeof(needle), "org.kde.StatusNotifierItem-%ld-1", (long)getpid());
 
-    /* Negative timeout_ms: watch while tray stays up; return 0 as soon as the tray host
-     * or our SNI item disappears so the app can bring back a startup-hidden window,
-     * or return 1 when the core is stopping. */
+    /* Negative timeout_ms: low-overhead 5 s watch while tray stays up.
+     * Return 0 ONLY on definite absence (host_rc == 0 || item_rc == 0); ignore transient
+     * D-Bus timeouts/errors (-1) so sleep/wake stalls never pop up a hidden window. */
     if (timeout_ms < 0) {
         int32_t ret = 1;
         while (!hidpp_core_is_stopping()) {
-            if (!dbus_sni_host_registered(&g, conn) ||
-                !dbus_sni_item_registered(&g, conn, needle)) {
+            int host_rc = dbus_sni_host_registered(&g, conn);
+            if (host_rc == 0) {
                 ret = 0;
                 break;
             }
-            for (int i = 0; i < 10 && !hidpp_core_is_stopping(); i++) {
+            if (host_rc == 1) {
+                int item_rc = dbus_sni_item_registered(&g, conn, needle);
+                if (item_rc == 0) {
+                    ret = 0;
+                    break;
+                }
+            }
+            for (int i = 0; i < 100 && !hidpp_core_is_stopping(); i++) {
                 hidpp_plat_sleep_ms(50u);
             }
         }
@@ -486,7 +497,7 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
         return ret;
     }
 
-    if (!dbus_sni_host_registered(&g, conn)) {
+    if (dbus_sni_host_registered(&g, conn) != 1) {
         g.obj_unref(conn);
         gio_dbus_unload(&g);
         return 0;
@@ -498,8 +509,8 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     for (;;) {
         if (hidpp_core_is_stopping()) break;
 
-        int found = dbus_sni_item_registered(&g, conn, needle);
-        if (found && dbus_sni_host_registered(&g, conn)) {
+        if (dbus_sni_item_registered(&g, conn, needle) == 1 &&
+            dbus_sni_host_registered(&g, conn) == 1) {
             ready = 1;
             break;
         }
@@ -652,29 +663,34 @@ static int probe_hidraw_rdesc(const char *hidraw_name, const char *dev_path, int
     return match;
 }
 
+static uint64_t fnv1a_64_str(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    if (!s) return h;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static void format_endpoint_id(char *out, size_t cap, const char *dev_path,
                                unsigned long long rdev, unsigned long long ino,
                                uint16_t vid, uint16_t pid,
                                const char *phys, const char *uniq) {
     if (!out || cap == 0) return;
-    char tmp[1024];
-    int n = snprintf(tmp, sizeof(tmp), "%s|%llx:%llx|%04x:%04x|%s|%s",
+    /* Fixed-width FNV-1a 64-bit hashes of phys & uniq keep endpoint_id under ~80 bytes
+     * so long USB/BT phys strings can never truncate and lose delimiters. */
+    int n = snprintf(out, cap, "%s|%llx:%llx|%04x:%04x|%016llx|%016llx",
                      dev_path ? dev_path : "",
                      rdev,
                      ino,
                      (unsigned)vid,
                      (unsigned)pid,
-                     phys ? phys : "",
-                     uniq ? uniq : "");
-    if (n <= 0) {
+                     (unsigned long long)fnv1a_64_str(phys ? phys : ""),
+                     (unsigned long long)fnv1a_64_str(uniq ? uniq : ""));
+    if (n <= 0 || (size_t)n >= cap) {
         out[0] = '\0';
-        return;
     }
-    size_t len = (size_t)n;
-    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
-    if (len >= cap) len = cap - 1;
-    memcpy(out, tmp, len);
-    out[len] = '\0';
 }
 
 static int cmp_linux_cand(const void *a, const void *b) {
@@ -795,8 +811,7 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     int has_sig = 0;
     unsigned long long want_rdev = 0, want_ino = 0;
     unsigned int want_vid = 0, want_pid = 0;
-    char want_phys[256];
-    want_phys[0] = '\0';
+    unsigned long long want_phys_h = 0, want_uniq_h = 0;
 
     const char *bar1 = strchr(endpoint_id, '|');
     if (bar1) {
@@ -805,16 +820,10 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
         memcpy(dev_path, endpoint_id, plen);
         dev_path[plen] = '\0';
 
-        const char *bar2 = strchr(bar1 + 1, '|');
-        const char *bar3 = bar2 ? strchr(bar2 + 1, '|') : NULL;
-        const char *bar4 = bar3 ? strchr(bar3 + 1, '|') : NULL;
-        if (!bar2 || !bar3 || !bar4) return NULL;
-        if (sscanf(bar1 + 1, "%llx:%llx", &want_rdev, &want_ino) != 2) return NULL;
-        if (sscanf(bar2 + 1, "%x:%x", &want_vid, &want_pid) != 2) return NULL;
-        size_t phys_len = (size_t)(bar4 - (bar3 + 1));
-        if (phys_len >= sizeof(want_phys)) phys_len = sizeof(want_phys) - 1;
-        memcpy(want_phys, bar3 + 1, phys_len);
-        want_phys[phys_len] = '\0';
+        if (sscanf(bar1 + 1, "%llx:%llx|%x:%x|%llx|%llx",
+                   &want_rdev, &want_ino, &want_vid, &want_pid, &want_phys_h, &want_uniq_h) != 6) {
+            return NULL;
+        }
         has_sig = 1;
     } else {
         snprintf(dev_path, sizeof(dev_path), "%s", endpoint_id);
@@ -848,15 +857,14 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
             close(fd);
             return NULL;
         }
-        if (want_phys[0] != '\0') {
-            char rawphys[256];
-            memset(rawphys, 0, sizeof(rawphys));
-            if (ioctl(fd, HIDIOCGRAWPHYS(sizeof(rawphys) - 1), rawphys) < 0 ||
-                strcmp(rawphys, want_phys) != 0) {
-                close(fd);
-                return NULL;
-            }
+        char rawphys[256];
+        memset(rawphys, 0, sizeof(rawphys));
+        if (ioctl(fd, HIDIOCGRAWPHYS(sizeof(rawphys) - 1), rawphys) < 0 ||
+            (unsigned long long)fnv1a_64_str(rawphys) != want_phys_h) {
+            close(fd);
+            return NULL;
         }
+        (void)want_uniq_h;
     }
 
     hidpp_dev_t *dev = (hidpp_dev_t *)malloc(sizeof(*dev));

@@ -70,6 +70,7 @@ typedef struct mock_device {
     int                   notify_disconnect_once;
     int                   caps_timeout;
     int                   disconnect_after_fn6;
+    int                   fn6_drop_ack;
 
     /* Pre-queued stale frames to test drain */
     mock_frame_t          stale[8];
@@ -455,6 +456,11 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
             r[8] = (uint8_t)(m->fn6_fake_y & 0xFF);
             r[9] = (uint8_t)m->fn6_fake_lod;
             dev_push_rx(dev, r, 20);
+        } else if (m->fn6_drop_ack) {
+            /* Device received fn=6 report, then dropped before ACK could arrive */
+            m->dpi_x = req_x;
+            m->dpi_y = (req_y >= HIDPP_MIN_DPI) ? req_y : req_x;
+            m->has_dpi_feature = 0;
         } else {
             m->dpi_x = req_x;
             m->dpi_y = (req_y >= HIDPP_MIN_DPI) ? req_y : req_x;
@@ -1780,6 +1786,25 @@ static void test_notify_first_open_from_empty_and_no_unrelated_flicker(void) {
     printf("[PASS] test_notify_first_open_from_empty_and_no_unrelated_flicker\n");
 }
 
+static hidpp_mutex_t g_case3_lock;
+static hidpp_cond_t  g_case3_cv;
+static int           g_case3_held = 0;
+static int           g_case3_release = 0;
+
+static void case3_hid_holder(void *unused) {
+    (void)unused;
+    hidpp_mutex_lock(&g_hid_lock);
+    hidpp_mutex_lock(&g_case3_lock);
+    g_case3_held = 1;
+    hidpp_cond_broadcast(&g_case3_cv);
+    while (!g_case3_release) {
+        hidpp_cond_wait(&g_case3_cv, &g_case3_lock);
+    }
+    hidpp_mutex_unlock(&g_case3_lock);
+    invalidate_cache_locked();
+    hidpp_mutex_unlock(&g_hid_lock);
+}
+
 static void test_single_target_write_no_spillover_to_second_mouse(void) {
     mock_reset();
     g_mock_dev_count = 2;
@@ -1835,6 +1860,124 @@ static void test_single_target_write_no_spillover_to_second_mouse(void) {
     mousedpi_snapshot_capture();
     assert(mousedpi_snap_applied_seq() == 9);
     assert(mousedpi_snap_connected() == 0);
+
+    mousedpi_stop_waits();
+
+    /* Case 2: Device A eats fn=6 and drops BEFORE ACK arrives -> Device B must receive 0 writes */
+    mock_reset();
+    g_mock_dev_count = 2;
+    a = &g_mock_devs[0];
+    snprintf(a->id, sizeof(a->id), "/dev/mouse_a2");
+    a->vid = 0x046D;
+    a->pid = 0xC54D;
+    a->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    a->has_dpi_feature = 1;
+    a->active_slot = 0x01;
+    a->dpi_x = 800;
+    a->dpi_y = 800;
+    a->lod = 2;
+    a->caps_present = 1;
+    a->caps_num_levels = 5;
+    a->caps_flags = 0x03;
+
+    b = &g_mock_devs[1];
+    snprintf(b->id, sizeof(b->id), "/dev/mouse_b2");
+    b->vid = 0x046D;
+    b->pid = 0xC54D;
+    b->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    b->has_dpi_feature = 1;
+    b->active_slot = 0x01;
+    b->dpi_x = 1200;
+    b->dpi_y = 1200;
+    b->lod = 1;
+    b->caps_present = 1;
+    b->caps_num_levels = 5;
+    b->caps_flags = 0x03;
+
+    assert(mousedpi_init_and_restore() == 1);
+    mock_lock();
+    a->fn6_drop_ack = 1;
+    mock_unlock();
+
+    cfg_before = g_mock_cfg_writes;
+    hidpp_mutex_lock(&g_hid_lock);
+    rc = set_dpi_locked_target(2400, 2400, 3, 1, 1, 10, "/dev/mouse_a2", 0x01);
+    hidpp_mutex_unlock(&g_hid_lock);
+
+    assert(rc == -4);
+    assert(a->fn6_writes == 1);
+    assert(b->fn6_writes == 0);
+    assert(b->dpi_x == 1200);
+    assert(g_mock_cfg_writes == cfg_before);
+    mousedpi_stop_waits();
+
+    /* Case 3: Queued user Set bound to Device A, topology switches to Device B before execution -> B untouched */
+    mock_reset();
+    g_mock_dev_count = 2;
+    a = &g_mock_devs[0];
+    snprintf(a->id, sizeof(a->id), "/dev/mouse_a3");
+    a->vid = 0x046D;
+    a->pid = 0xC54D;
+    a->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    a->has_dpi_feature = 1;
+    a->active_slot = 0x01;
+    a->dpi_x = 800;
+    a->dpi_y = 800;
+    a->lod = 2;
+    a->caps_present = 1;
+    a->caps_num_levels = 5;
+    a->caps_flags = 0x03;
+
+    b = &g_mock_devs[1];
+    snprintf(b->id, sizeof(b->id), "/dev/mouse_b3");
+    b->vid = 0x046D;
+    b->pid = 0xC54D;
+    b->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    b->has_dpi_feature = 1;
+    b->active_slot = 0x01;
+    b->dpi_x = 1200;
+    b->dpi_y = 1200;
+    b->lod = 1;
+    b->caps_present = 1;
+    b->caps_num_levels = 5;
+    b->caps_flags = 0x03;
+
+    assert(mousedpi_init_and_restore() == 1);
+    /* Hold g_hid_lock on a separate thread (matching real worker/UI concurrency) while main
+     * queues Set for A and unplugs A so refresher sees B after topology switch. */
+    hidpp_mutex_init(&g_case3_lock);
+    hidpp_cond_init(&g_case3_cv);
+    g_case3_held = 0;
+    g_case3_release = 0;
+    hidpp_thread_t holder;
+    int th_ok = hidpp_thread_start(&holder, case3_hid_holder, NULL);
+    assert(th_ok == 1);
+    hidpp_mutex_lock(&g_case3_lock);
+    while (!g_case3_held) {
+        hidpp_cond_wait(&g_case3_cv, &g_case3_lock);
+    }
+    hidpp_mutex_unlock(&g_case3_lock);
+
+    int32_t rev_before = mousedpi_state_rev();
+    mousedpi_request_set_seq(11, 2800, 3);
+    mock_lock();
+    a->has_dpi_feature = 0;
+    mock_unlock();
+
+    hidpp_mutex_lock(&g_case3_lock);
+    g_case3_release = 1;
+    hidpp_cond_broadcast(&g_case3_cv);
+    hidpp_mutex_unlock(&g_case3_lock);
+    hidpp_thread_join(holder);
+
+    int32_t rev_after = mousedpi_wait_rev(rev_before);
+    assert(rev_after > rev_before);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_applied_seq() == 11);
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_dpi_x() == 1200);
+    assert(b->fn6_writes == 0);
+    assert(b->dpi_x == 1200);
 
     mousedpi_stop_waits();
     printf("[PASS] test_single_target_write_no_spillover_to_second_mouse\n");

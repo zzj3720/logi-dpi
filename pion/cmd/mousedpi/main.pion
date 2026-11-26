@@ -113,14 +113,15 @@ fn main(world : World) -> Int {
   hostapi::window_center()
   let want_tray = c_started_hidden() != 0
   let can_tray = c_can_hide_to_tray() != 0
-  let linux_wait_tray = is_linux && want_tray
-  let hidden = !is_linux && want_tray && can_tray
+  let linux_tray_watch = is_linux && want_tray && can_tray
+  let hidden = want_tray && can_tray
   if hidden {
-    // Started in tray mode (e.g. login autostart) on macOS/Windows when a tray host is available.
+    // Started in tray mode (e.g. login autostart) when a tray host is available.
+    // On Linux this ensures window_shown = 1 in the host (never stuck in held state on tray click),
+    // while the watcher task restores the window if SNI registration fails or the tray watcher disappears.
     hostapi::window_hide()
   } else {
     // Keep out of sight until its first frame is drawn, centered, then shown (no jump, no blank flash).
-    // On Linux with --tray, stay held until SNI tray registration is confirmed online.
     hostapi::window_hold()
   }
   hostapi::menu_setup(if is_macos { macos_menu } else { tray_menu })
@@ -162,12 +163,14 @@ fn main(world : World) -> Int {
   })
   scope(world, fn(s : Scope) -> Unit {
     spawn(s, fn() -> Unit { ctx.run_loop(handle) })
-    if linux_wait_tray {
+    if linux_tray_watch {
       spawn(s, fn() -> Unit {
         let ready = c_wait_tray_ready(1500) != 0
-        tray_decisions.emit(ready)
-        if ready {
-          // Stay watching: if the desktop tray watcher later disappears while hidden, bring the window back.
+        if !ready {
+          // Startup SNI registration failed or timed out: reveal the hidden window.
+          tray_decisions.emit(false)
+        } else {
+          // Confirmed registered: stay watching and reveal only if the tray definitely disappears.
           if c_wait_tray_ready(-1) == 0 {
             tray_decisions.emit(false)
           }
@@ -220,14 +223,10 @@ fn main(world : World) -> Int {
           })
         }
         // Shown once its first frame is drawn, unless started hidden in the tray.
-        if linux_wait_tray {
+        if linux_tray_watch {
           let _ = ui::on_before_frame(fn() {
             let _ = tray_decisions.drain(fn(ready : Bool) -> Unit {
-              if ready {
-                // Hide cleanly without invoking close/quit; the watcher task calls window_show()
-                // automatically if the desktop tray watcher ever disappears afterwards.
-                hostapi::window_hide()
-              } else {
+              if !ready {
                 hostapi::window_show()
               }
             })
