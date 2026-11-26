@@ -64,6 +64,9 @@ static inline hidpp_endpoint_kind_t hidpp_classify_pid(uint16_t pid) {
         case 0xC534u:
             return HIDPP_KIND_MULTI_RECEIVER;
         default:
+            if ((pid & 0xFF00u) == 0xC500u) {
+                return HIDPP_KIND_MULTI_RECEIVER;
+            }
             return HIDPP_KIND_DIRECT_WIRED;
     }
 }
@@ -90,6 +93,7 @@ typedef struct hidpp_dev hidpp_dev_t;
 
 /* ---- Core hooks callable from platform layer ---- */
 void hidpp_core_signal_wake(void);
+void hidpp_core_signal_topology_change(void);
 int  hidpp_core_is_stopping(void);
 
 /* ---- Platform transport & OS hooks (implemented by win / macos / linux / test mock) ---- */
@@ -117,6 +121,7 @@ uint64_t hidpp_plat_mouse_idle_ms(void);
 
 int32_t  hidpp_plat_started_hidden(void);
 int32_t  hidpp_plat_can_hide_to_tray(void);
+int32_t  hidpp_plat_wait_tray_ready(int32_t timeout_ms);
 int32_t  hidpp_plat_get_autostart(void);
 int32_t  hidpp_plat_set_autostart(int32_t enable);
 char    *hidpp_plat_picture_path_dup(void);
@@ -124,12 +129,13 @@ char    *hidpp_plat_picture_path_dup(void);
 int      hidpp_plat_config_read(int32_t *out_dpi, int32_t *out_lod);
 int      hidpp_plat_config_write(int32_t dpi, int32_t lod);
 
-/* ---- Public C ABI (24 exported symbols) ---- */
+/* ---- Public C ABI (28 exported symbols) ---- */
 int32_t mousedpi_started_hidden(void);
 int32_t mousedpi_peek_config(int32_t which);
 int32_t mousedpi_init_and_restore(void);
 void    mousedpi_request_refresh(void);
 void    mousedpi_request_set(int32_t dpi, int32_t lod);
+void    mousedpi_request_set_seq(int32_t seq, int32_t dpi, int32_t lod);
 int32_t mousedpi_state_rev(void);
 int32_t mousedpi_wait_rev(int32_t seen);
 void    mousedpi_stop_waits(void);
@@ -142,6 +148,8 @@ int32_t mousedpi_set_autostart(int32_t enable);
 
 void    mousedpi_request_wake_restore(void);
 void    mousedpi_snapshot_capture(void);
+int32_t mousedpi_snap_rev(void);
+int32_t mousedpi_snap_applied_seq(void);
 int32_t mousedpi_snap_connected(void);
 int32_t mousedpi_snap_dpi_x(void);
 int32_t mousedpi_snap_lod(void);
@@ -150,6 +158,7 @@ int32_t mousedpi_snap_perm_denied(void);
 char   *mousedpi_snap_device_name_dup(void);
 char   *mousedpi_picture_path_dup(void);
 int32_t mousedpi_can_hide_to_tray(void);
+int32_t mousedpi_wait_tray_ready(int32_t timeout_ms);
 
 #ifdef __cplusplus
 }

@@ -382,6 +382,7 @@ int hidpp_posix_config_write_file(const char *path, int32_t dpi, int32_t lod) {
 
 typedef struct hidpp_state {
     int32_t rev;
+    int32_t applied_seq;
     int32_t connected;
     int32_t perm_denied;
     int32_t dpi_x;
@@ -392,7 +393,7 @@ typedef struct hidpp_state {
     char    device_name[64];
 } hidpp_state_t;
 
-static int            g_inited = 0;
+static hidpp_mutex_t  g_life_lock;
 static hidpp_mutex_t  g_hid_lock;
 static hidpp_mutex_t  g_snap_lock;
 static hidpp_cond_t   g_rev_cv;
@@ -407,8 +408,11 @@ static int            g_refresh_pending = 0;
 static int            g_want_pending = 0;
 static int32_t        g_want_dpi = HIDPP_DEFAULT_DPI;
 static int32_t        g_want_lod = HIDPP_DEFAULT_LOD;
+static int32_t        g_want_seq = 0;
 
 static int            g_stopping = 0;
+static int            g_topology_dirty = 0;
+static int            g_feat_cache_dirty = 0;
 static int            g_watchers_started = 0;
 static hidpp_thread_t g_th_wake;
 static int            g_th_wake_valid = 0;
@@ -428,6 +432,7 @@ static int32_t        g_saved_lod = HIDPP_DEFAULT_LOD;
 
 /* Endpoint & feature cache (protected by g_hid_lock) */
 static uint64_t              g_endpoint_gen = 1;
+static uint64_t              g_last_read_gen = 0;
 static int                   g_cache_valid = 0;
 static char                  g_cached_endpoint_id[HIDPP_ENDPOINT_ID_MAX];
 static hidpp_endpoint_kind_t g_cached_kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
@@ -436,54 +441,97 @@ static uint8_t               g_cached_idx_dpi = 0;
 static uint8_t               g_cached_idx_ob = 0;
 static uint8_t               g_cached_idx_bat = 0;
 static uint8_t               g_cached_idx_name = 0;
+static int                   g_cached_caps_read = 0;
+static int                   g_cached_has_indep_y = 1;
+static int                   g_cached_has_lod = 1;
 static uint64_t              g_notif_enabled_gen = 0;
 
 static void init_default_state(hidpp_state_t *s) {
     memset(s, 0, sizeof(*s));
     s->rev = 0;
+    s->applied_seq = 0;
     s->connected = 0;
     s->perm_denied = 0;
     s->dpi_x = HIDPP_DEFAULT_DPI;
     s->dpi_y = HIDPP_DEFAULT_DPI;
     s->lod = HIDPP_DEFAULT_LOD;
     s->battery = -1;
-    s->mode = 0;
+    s->mode = -1;
     snprintf(s->device_name, sizeof(s->device_name), "%s", HIDPP_DEFAULT_DEVICE_NAME);
 }
 
-static void ensure_core_init(void) {
-    if (!g_inited) {
-        hidpp_mutex_init(&g_hid_lock);
-        hidpp_mutex_init(&g_snap_lock);
-        hidpp_cond_init(&g_rev_cv);
-        hidpp_mutex_init(&g_wake_lock);
-        hidpp_cond_init(&g_wake_cv);
-        hidpp_mutex_init(&g_refresh_lock);
-        hidpp_cond_init(&g_refresh_cv);
-        init_default_state(&g_live_state);
-        init_default_state(&g_frozen_snap);
-        g_stopping = 0;
-        g_inited = 1;
-    }
-    hidpp_plat_init();
+static void core_init_primitives(void) {
+    hidpp_mutex_init(&g_life_lock);
+    hidpp_mutex_init(&g_hid_lock);
+    hidpp_mutex_init(&g_snap_lock);
+    hidpp_cond_init(&g_rev_cv);
+    hidpp_mutex_init(&g_wake_lock);
+    hidpp_cond_init(&g_wake_cv);
+    hidpp_mutex_init(&g_refresh_lock);
+    hidpp_cond_init(&g_refresh_cv);
+    init_default_state(&g_live_state);
+    init_default_state(&g_frozen_snap);
+    g_stopping = 0;
 }
 
+#if defined(_WIN32)
+static INIT_ONCE g_core_init_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK core_init_once_win(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    core_init_primitives();
+    return TRUE;
+}
+static void ensure_core_mutexes(void) {
+    InitOnceExecuteOnce(&g_core_init_once, core_init_once_win, NULL, NULL);
+}
+#else
+static pthread_once_t g_core_init_once = PTHREAD_ONCE_INIT;
+static void ensure_core_mutexes(void) {
+    pthread_once(&g_core_init_once, core_init_primitives);
+}
+#endif
+
 int hidpp_core_is_stopping(void) {
-    if (!g_inited) return 0;
+    ensure_core_mutexes();
     hidpp_mutex_lock(&g_snap_lock);
     int s = g_stopping;
     hidpp_mutex_unlock(&g_snap_lock);
     return s;
 }
 
-static void commit_state(const hidpp_state_t *next, int bump_rev) {
+static void ensure_core_init(void) {
+    ensure_core_mutexes();
+    if (!hidpp_core_is_stopping()) {
+        hidpp_plat_init();
+    }
+}
+
+static void commit_state_seq(const hidpp_state_t *next, int bump_rev, int32_t min_applied_seq) {
     hidpp_mutex_lock(&g_snap_lock);
     int32_t rev = g_live_state.rev;
+    int32_t prev_seq = g_live_state.applied_seq;
     g_live_state = *next;
+    int32_t new_seq = g_live_state.applied_seq;
+    if (prev_seq > new_seq) new_seq = prev_seq;
+    if (min_applied_seq > new_seq) new_seq = min_applied_seq;
+    g_live_state.applied_seq = new_seq;
     g_live_state.rev = bump_rev ? (rev + 1) : rev;
     if (bump_rev) {
         hidpp_cond_broadcast(&g_rev_cv);
     }
+    hidpp_mutex_unlock(&g_snap_lock);
+}
+
+static void commit_state(const hidpp_state_t *next, int bump_rev) {
+    commit_state_seq(next, bump_rev, 0);
+}
+
+static void bump_state_rev_only(void) {
+    hidpp_mutex_lock(&g_snap_lock);
+    g_live_state.rev++;
+    hidpp_cond_broadcast(&g_rev_cv);
     hidpp_mutex_unlock(&g_snap_lock);
 }
 
@@ -494,14 +542,36 @@ static hidpp_state_t load_live_state(void) {
     return s;
 }
 
-static void invalidate_cache_locked(void) {
-    g_cache_valid = 0;
-    g_endpoint_gen++;
-    g_cached_endpoint_id[0] = '\0';
+static void invalidate_feature_cache_locked(void) {
     g_cached_idx_dpi = 0;
     g_cached_idx_ob = 0;
     g_cached_idx_bat = 0;
     g_cached_idx_name = 0;
+    g_cached_caps_read = 0;
+    g_cached_has_indep_y = 1;
+    g_cached_has_lod = 1;
+}
+
+static void invalidate_cache_locked(void) {
+    g_cache_valid = 0;
+    g_endpoint_gen++;
+    g_cached_endpoint_id[0] = '\0';
+    invalidate_feature_cache_locked();
+}
+
+static void consume_dirty_flags_locked(void) {
+    hidpp_mutex_lock(&g_snap_lock);
+    int topo = g_topology_dirty;
+    int feat = g_feat_cache_dirty;
+    g_topology_dirty = 0;
+    g_feat_cache_dirty = 0;
+    hidpp_mutex_unlock(&g_snap_lock);
+
+    if (topo) {
+        invalidate_cache_locked();
+    } else if (feat) {
+        invalidate_feature_cache_locked();
+    }
 }
 
 /* ---- Strict HID++ 2.0 transaction engine ---- */
@@ -548,13 +618,15 @@ static int hidpp_xfer(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t feat_idx, uint8
         if (got < 0) return HIDPP_XFER_ERR_IO;
         if (got == 0) return HIDPP_XFER_ERR_TIMEOUT;
 
-        /* 1. Exact long HID++ 2.0 response */
-        if (got >= HIDPP_LONG_LEN &&
-            r[0] == HIDPP_LONG_REPORT_ID &&
+        /* 1. Exact long or short HID++ 2.0 response */
+        if (((r[0] == HIDPP_LONG_REPORT_ID && got >= HIDPP_LONG_LEN) ||
+             (r[0] == HIDPP_SHORT_REPORT_ID && got >= HIDPP_SHORT_LEN)) &&
             r[1] == dev_idx &&
             r[2] == feat_idx &&
             r[3] == fn_sw) {
-            memcpy(resp, r, HIDPP_LONG_LEN);
+            int cpy = got > HIDPP_LONG_LEN ? HIDPP_LONG_LEN : got;
+            memset(resp, 0, HIDPP_LONG_LEN);
+            memcpy(resp, r, (size_t)cpy);
             if (out_got) *out_got = got;
             return HIDPP_XFER_OK;
         }
@@ -573,12 +645,14 @@ static int hidpp_xfer(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t feat_idx, uint8
             return HIDPP_XFER_ERR_HIDPP2;
         }
 
-        /* 3. HID++ 1.0 receiver error (e.g. mouse offline / invalid sub-id): fail fast */
+        /* 3. HID++ 1.0 receiver error (e.g. mouse offline / invalid sub-id): fail fast.
+         * Frame layout: [0x10, dev_idx, 0x8F, sub_id(=feat_idx), address(=fn_sw), err_code, 0x00]. */
         if (got >= HIDPP_SHORT_LEN &&
             r[0] == HIDPP_SHORT_REPORT_ID &&
             r[1] == dev_idx &&
             r[2] == 0x8Fu &&
-            r[3] == feat_idx) {
+            r[3] == feat_idx &&
+            r[4] == fn_sw) {
             int cpy = got > HIDPP_LONG_LEN ? HIDPP_LONG_LEN : got;
             memset(resp, 0, HIDPP_LONG_LEN);
             memcpy(resp, r, (size_t)cpy);
@@ -600,15 +674,57 @@ static uint8_t get_feature_idx(hidpp_dev_t *dev, uint8_t dev_idx, uint16_t fid) 
     return r[4];
 }
 
-/* Best-effort HID++ 1.0 register 0x00 wireless notification enable on receivers. */
-static void try_enable_wireless_notif(hidpp_dev_t *dev) {
-    uint8_t req[HIDPP_SHORT_LEN] = {
-        HIDPP_SHORT_REPORT_ID, 0xFFu, 0x80u, 0x00u, 0x00u, 0x01u, 0x00u
+/* Best-effort HID++ 1.0 register 0x00 read-modify-write to enable wireless notifications
+ * without clobbering existing receiver notification flags. */
+static int try_enable_wireless_notif(hidpp_dev_t *dev) {
+    uint8_t b4 = 0x00u;
+    uint8_t b5 = 0x01u;
+    uint8_t b6 = 0x00u;
+
+    uint8_t rreq[HIDPP_SHORT_LEN] = {
+        HIDPP_SHORT_REPORT_ID, 0xFFu, 0x81u, 0x00u, 0x00u, 0x00u, 0x00u
     };
-    (void)hidpp_plat_write(dev, req, sizeof(req));
+    hidpp_plat_drain(dev);
+    if (hidpp_plat_write(dev, rreq, sizeof(rreq)) >= HIDPP_SHORT_LEN) {
+        uint64_t deadline = hidpp_plat_now_ms() + 150u;
+        for (;;) {
+            uint64_t now = hidpp_plat_now_ms();
+            if (now >= deadline) break;
+            uint64_t rem64 = deadline - now;
+            int rem = rem64 > 150u ? 150 : (int)rem64;
+            if (rem <= 0) rem = 1;
+            uint8_t r[64];
+            memset(r, 0, sizeof(r));
+            int got = hidpp_plat_read(dev, r, sizeof(r), rem);
+            if (got <= 0) break;
+            if (got >= HIDPP_SHORT_LEN &&
+                r[0] == HIDPP_SHORT_REPORT_ID &&
+                r[1] == 0xFFu &&
+                r[2] == 0x81u &&
+                r[3] == 0x00u) {
+                b4 = r[4];
+                b5 = (uint8_t)(r[5] | 0x01u);
+                b6 = r[6];
+                break;
+            }
+            if (got >= HIDPP_SHORT_LEN &&
+                r[0] == HIDPP_SHORT_REPORT_ID &&
+                r[1] == 0xFFu &&
+                r[2] == 0x8Fu &&
+                r[3] == 0x81u &&
+                r[4] == 0x00u) {
+                break;
+            }
+        }
+    }
+
+    uint8_t wreq[HIDPP_SHORT_LEN] = {
+        HIDPP_SHORT_REPORT_ID, 0xFFu, 0x80u, 0x00u, b4, b5, b6
+    };
+    return (hidpp_plat_write(dev, wreq, sizeof(wreq)) >= HIDPP_SHORT_LEN) ? 1 : 0;
 }
 
-/* Dynamic device name via HID++ 2.0 feature 0x0005. */
+/* Dynamic device name via HID++ 2.0 feature 0x0005 (preserves valid UTF-8, filters control chars). */
 static void read_device_name(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_name,
                              char out_name[64]) {
     if (idx_name == 0) return;
@@ -636,7 +752,7 @@ static void read_device_name(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_name
                 off = total;
                 break;
             }
-            if (ch >= 0x20u && ch <= 0x7Eu) {
+            if (ch >= 0x20u && ch != 0x7Fu) {
                 buf[pos++] = (char)ch;
             }
         }
@@ -661,15 +777,18 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
 
     hidpp_endpoint_info_t eps[HIDPP_MAX_ENDPOINTS];
     int perm_denied = 0;
+    int any_opened = 0;
     int count = hidpp_plat_enumerate(eps, HIDPP_MAX_ENDPOINTS, &perm_denied);
 
     for (int i = 0; i < count; i++) {
         int ep_perm = 0;
         hidpp_dev_t *dev = hidpp_plat_open(eps[i].id, 0, &ep_perm);
         if (!dev) {
-            if (ep_perm) perm_denied = 1;
+            if (ep_perm && !any_opened) perm_denied = 1;
             continue;
         }
+        any_opened = 1;
+        perm_denied = 0;
 
         uint8_t slots[6];
         int nslots = 0;
@@ -678,7 +797,8 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
             nslots = 1;
         } else if (eps[i].kind == HIDPP_KIND_DIRECT_WIRED) {
             slots[0] = 0xFFu;
-            nslots = 1;
+            slots[1] = 0x00u; /* BLE HID++ 2.0 direct slot */
+            nslots = 2;
         } else {
             for (int s = 0; s < 6; s++) slots[s] = (uint8_t)(s + 1);
             nslots = 6;
@@ -693,16 +813,15 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
                 g_cached_endpoint_id[sizeof(g_cached_endpoint_id) - 1] = '\0';
                 g_cached_kind = eps[i].kind;
                 g_cached_dev_idx = slots[s];
+                invalidate_feature_cache_locked();
                 g_cached_idx_dpi = idx_dpi;
-                g_cached_idx_ob = 0;
-                g_cached_idx_bat = 0;
-                g_cached_idx_name = 0;
 
                 if ((eps[i].kind == HIDPP_KIND_LIGHTSPEED_RECEIVER ||
                      eps[i].kind == HIDPP_KIND_MULTI_RECEIVER) &&
                     g_notif_enabled_gen != g_endpoint_gen) {
-                    try_enable_wireless_notif(dev);
-                    g_notif_enabled_gen = g_endpoint_gen;
+                    if (try_enable_wireless_notif(dev)) {
+                        g_notif_enabled_gen = g_endpoint_gen;
+                    }
                 }
                 if (out_perm_denied) *out_perm_denied = 0;
                 return dev;
@@ -711,11 +830,55 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
         hidpp_plat_close(dev);
     }
 
-    if (out_perm_denied) *out_perm_denied = perm_denied;
+    if (out_perm_denied) *out_perm_denied = any_opened ? 0 : perm_denied;
     return NULL;
 }
 
-static int32_t read_state_locked(int bump_rev) {
+static void ensure_dpi_caps_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_dpi) {
+    if (g_cached_caps_read) return;
+    g_cached_caps_read = 1;
+    g_cached_has_indep_y = 1;
+    g_cached_has_lod = 1;
+
+    uint8_t r[HIDPP_LONG_LEN];
+    int got = 0;
+    uint8_t p0[1] = { 0x00u };
+    if (hidpp_xfer(dev, dev_idx, idx_dpi, 1, p0, 1, r, &got) == HIDPP_XFER_OK && got >= 6) {
+        uint8_t flags = r[5];
+        g_cached_has_indep_y = (flags & 0x01u) ? 1 : 0;
+        g_cached_has_lod     = (flags & 0x02u) ? 1 : 0;
+    }
+}
+
+static int read_sensor_dpi_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_dpi,
+                                  int32_t *out_x, int32_t *out_y, int32_t *out_lod,
+                                  int32_t fallback_lod) {
+    uint8_t r[HIDPP_LONG_LEN];
+    int got = 0;
+    uint8_t p0[1] = { 0x00u };
+    if (hidpp_xfer(dev, dev_idx, idx_dpi, 5, p0, 1, r, &got) != HIDPP_XFER_OK || got < 14) {
+        return 0;
+    }
+    int32_t dx = ((int32_t)r[5] << 8) | r[6];
+    if (dx == 0) {
+        dx = ((int32_t)r[7] << 8) | r[8]; /* default_dpi_x fallback */
+    }
+    if (dx < HIDPP_MIN_DPI || dx > HIDPP_MAX_DPI) {
+        return 0;
+    }
+    int32_t dy = ((int32_t)r[9] << 8) | r[10];
+    if (dy < HIDPP_MIN_DPI) dy = dx;
+    if (r[13] == 0) {
+        g_cached_has_lod = 0;
+    }
+    int32_t lod = (r[13] >= 1 && r[13] <= 3) ? (int32_t)r[13] : fallback_lod;
+    if (out_x) *out_x = dx;
+    if (out_y) *out_y = dy;
+    if (out_lod) *out_lod = lod;
+    return 1;
+}
+
+static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
     hidpp_state_t st = load_live_state();
     int perm_denied = 0;
 
@@ -725,7 +888,7 @@ static int32_t read_state_locked(int bump_rev) {
         if (!dev) {
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return 0;
         }
 
@@ -741,20 +904,17 @@ static int32_t read_state_locked(int bump_rev) {
             if (was_cached) continue;
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return 0;
         }
 
-        uint8_t r[HIDPP_LONG_LEN];
-        int got = 0;
-        uint8_t p0[1] = { 0x00u };
-        if (hidpp_xfer(dev, dev_idx, idx_dpi, 5, p0, 1, r, &got) == HIDPP_XFER_OK && got >= 14) {
-            int32_t dx = ((int32_t)r[5] << 8) | r[6];
-            int32_t dy = ((int32_t)r[9] << 8) | r[10];
-            if (dy < HIDPP_MIN_DPI) dy = dx;
+        ensure_dpi_caps_locked(dev, dev_idx, idx_dpi);
+
+        int32_t dx = 0, dy = 0, lod = st.lod;
+        if (read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &dx, &dy, &lod, st.lod)) {
             st.dpi_x = dx;
             st.dpi_y = dy;
-            if (r[13] >= 1 && r[13] <= 3) st.lod = r[13];
+            st.lod = lod;
             st.connected = 1;
             st.perm_denied = 0;
         } else {
@@ -763,10 +923,18 @@ static int32_t read_state_locked(int bump_rev) {
             if (was_cached) continue;
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return 0;
         }
 
+        if (g_last_read_gen != g_endpoint_gen) {
+            st.battery = -1;
+            st.mode = -1;
+            st.device_name[0] = '\0';
+        }
+
+        uint8_t r[HIDPP_LONG_LEN];
+        int got = 0;
         if (g_cached_idx_bat == 0) {
             g_cached_idx_bat = get_feature_idx(dev, dev_idx, HIDPP_FEAT_BATTERY);
         }
@@ -791,19 +959,24 @@ static int32_t read_state_locked(int bump_rev) {
         if (g_cached_idx_name != 0) {
             read_device_name(dev, dev_idx, g_cached_idx_name, st.device_name);
         }
+        if (st.device_name[0] == '\0') {
+            snprintf(st.device_name, sizeof(st.device_name), "%s", HIDPP_DEFAULT_DEVICE_NAME);
+        }
+        g_last_read_gen = g_endpoint_gen;
 
         hidpp_plat_close(dev);
-        commit_state(&st, bump_rev);
+        commit_state_seq(&st, bump_rev, min_applied_seq);
         return 1;
     }
 
     st.connected = 0;
     st.perm_denied = perm_denied ? 1 : 0;
-    commit_state(&st, bump_rev);
+    commit_state_seq(&st, bump_rev, min_applied_seq);
     return 0;
 }
 
-static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg, int bump_rev) {
+static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg,
+                              int bump_rev, int32_t min_applied_seq) {
     if (x < HIDPP_MIN_DPI) x = HIDPP_MIN_DPI;
     if (x > HIDPP_MAX_DPI) x = HIDPP_MAX_DPI;
     if (y < HIDPP_MIN_DPI) y = HIDPP_MIN_DPI;
@@ -820,7 +993,7 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg, i
         if (!dev) {
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return -1;
         }
 
@@ -836,9 +1009,11 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg, i
             if (was_cached) continue;
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return -2;
         }
+
+        ensure_dpi_caps_locked(dev, dev_idx, idx_dpi);
 
         uint8_t r[HIDPP_LONG_LEN];
         int got = 0;
@@ -852,31 +1027,54 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg, i
             }
         }
 
+        int32_t y_send = g_cached_has_indep_y ? y : 0;
+        int32_t lod_send = g_cached_has_lod ? lod : 0;
         uint8_t pd[6] = {
             0x00u,
             (uint8_t)((x >> 8) & 0xFF),
             (uint8_t)(x & 0xFF),
-            (uint8_t)((y >> 8) & 0xFF),
-            (uint8_t)(y & 0xFF),
-            (uint8_t)lod
+            (uint8_t)((y_send >> 8) & 0xFF),
+            (uint8_t)(y_send & 0xFF),
+            (uint8_t)lod_send
         };
         int rc = hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got);
-        hidpp_plat_close(dev);
 
         if (rc == HIDPP_XFER_ERR_HIDPP2) {
+            hidpp_plat_close(dev);
             return -(100 + (int32_t)r[5]);
         }
-        if (rc != HIDPP_XFER_OK || got < 10) {
+        if (rc != HIDPP_XFER_OK) {
+            hidpp_plat_close(dev);
             invalidate_cache_locked();
             if (was_cached) continue;
             st.connected = 0;
-            commit_state(&st, bump_rev);
+            commit_state_seq(&st, bump_rev, min_applied_seq);
             return -3;
         }
 
-        st.dpi_x = ((int32_t)r[5] << 8) | r[6];
-        st.dpi_y = ((int32_t)r[7] << 8) | r[8];
-        if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
+        int32_t echo_x = (got >= 10) ? (((int32_t)r[5] << 8) | r[6]) : 0;
+        if (echo_x >= HIDPP_MIN_DPI && echo_x <= HIDPP_MAX_DPI) {
+            st.dpi_x = echo_x;
+            int32_t echo_y = ((int32_t)r[7] << 8) | r[8];
+            st.dpi_y = (echo_y >= HIDPP_MIN_DPI && echo_y <= HIDPP_MAX_DPI) ? echo_y : echo_x;
+            if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
+        } else {
+            /* Zero-filled or short ACK: read back real DPI/LOD via fn=5; never store 0. */
+            int32_t rx = 0, ry = 0, rlod = st.lod;
+            if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
+                hidpp_plat_close(dev);
+                invalidate_cache_locked();
+                if (was_cached) continue;
+                st.connected = 0;
+                commit_state_seq(&st, bump_rev, min_applied_seq);
+                return -3;
+            }
+            st.dpi_x = rx;
+            st.dpi_y = ry;
+            st.lod = rlod;
+        }
+        hidpp_plat_close(dev);
+
         st.connected = 1;
         st.perm_denied = 0;
 
@@ -886,7 +1084,7 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg, i
             g_saved_lod = st.lod;
             (void)hidpp_plat_config_write(g_saved_dpi, g_saved_lod);
         }
-        commit_state(&st, bump_rev);
+        commit_state_seq(&st, bump_rev, min_applied_seq);
         return 0;
     }
 
@@ -921,24 +1119,31 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
         return 0;
     }
 
+    ensure_dpi_caps_locked(dev, dev_idx, idx_dpi);
+
+    int new_device = (g_last_read_gen != g_endpoint_gen) ? 1 : 0;
+    if (new_device) {
+        st.battery = -1;
+        st.mode = -1;
+        snprintf(st.device_name, sizeof(st.device_name), "%s", HIDPP_DEFAULT_DEVICE_NAME);
+    }
+
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
     int need_write = force_write;
 
     if (!need_write) {
-        uint8_t p0[1] = { 0x00u };
-        if (hidpp_xfer(dev, dev_idx, idx_dpi, 5, p0, 1, r, &got) == HIDPP_XFER_OK && got >= 14) {
-            int32_t cx = ((int32_t)r[5] << 8) | r[6];
-            int32_t cy = ((int32_t)r[9] << 8) | r[10];
-            if (cy < HIDPP_MIN_DPI) cy = cx;
-            int32_t clod = (r[13] >= 1 && r[13] <= 3) ? r[13] : st.lod;
-            int diff = (st.connected == 0 || st.dpi_x != cx || st.dpi_y != cy || st.lod != clod);
+        int32_t cx = 0, cy = 0, clod = st.lod;
+        if (read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &cx, &cy, &clod, st.lod)) {
+            int diff = (new_device || st.connected == 0 || st.dpi_x != cx || st.dpi_y != cy || st.lod != clod);
             st.dpi_x = cx;
             st.dpi_y = cy;
             st.lod = clod;
             st.connected = 1;
             st.perm_denied = 0;
-            if (cx != g_saved_dpi || cy != g_saved_dpi || clod != g_saved_lod) {
+            int y_mismatch = g_cached_has_indep_y && (cy != g_saved_dpi);
+            int lod_mismatch = g_cached_has_lod && (clod != g_saved_lod);
+            if (cx != g_saved_dpi || y_mismatch || lod_mismatch) {
                 need_write = 1;
             } else if (diff) {
                 commit_state(&st, 1);
@@ -963,21 +1168,39 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
         }
 
         int32_t x = g_saved_dpi;
-        int32_t lod = g_saved_lod;
+        int32_t y_send = g_cached_has_indep_y ? x : 0;
+        int32_t lod_send = g_cached_has_lod ? g_saved_lod : 0;
         uint8_t pd[6] = {
             0x00u,
             (uint8_t)((x >> 8) & 0xFF),
             (uint8_t)(x & 0xFF),
-            (uint8_t)((x >> 8) & 0xFF),
-            (uint8_t)(x & 0xFF),
-            (uint8_t)lod
+            (uint8_t)((y_send >> 8) & 0xFF),
+            (uint8_t)(y_send & 0xFF),
+            (uint8_t)lod_send
         };
-        if (hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got) == HIDPP_XFER_OK && got >= 10) {
-            st.dpi_x = ((int32_t)r[5] << 8) | r[6];
-            st.dpi_y = ((int32_t)r[7] << 8) | r[8];
-            if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
+        if (hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got) == HIDPP_XFER_OK) {
+            int32_t echo_x = (got >= 10) ? (((int32_t)r[5] << 8) | r[6]) : 0;
+            if (echo_x >= HIDPP_MIN_DPI && echo_x <= HIDPP_MAX_DPI) {
+                st.dpi_x = echo_x;
+                int32_t echo_y = ((int32_t)r[7] << 8) | r[8];
+                st.dpi_y = (echo_y >= HIDPP_MIN_DPI && echo_y <= HIDPP_MAX_DPI) ? echo_y : echo_x;
+                if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
+            } else {
+                int32_t rx = 0, ry = 0, rlod = st.lod;
+                if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
+                    hidpp_plat_close(dev);
+                    invalidate_cache_locked();
+                    return 0;
+                }
+                st.dpi_x = rx;
+                st.dpi_y = ry;
+                st.lod = rlod;
+            }
             st.connected = 1;
             st.perm_denied = 0;
+            /* Sync saved targets with device-confirmed values to prevent repeated 2s writebacks. */
+            g_saved_dpi = st.dpi_x;
+            g_saved_lod = st.lod;
             commit_state(&st, 1);
             if (out_changed) *out_changed = 1;
         } else {
@@ -994,11 +1217,35 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
 /* ---- Background threads ---- */
 
 void hidpp_core_signal_wake(void) {
-    if (!g_inited) return;
+    ensure_core_mutexes();
     hidpp_mutex_lock(&g_wake_lock);
     g_wake_burst = 1;
     hidpp_cond_broadcast(&g_wake_cv);
     hidpp_mutex_unlock(&g_wake_lock);
+}
+
+void hidpp_core_signal_topology_change(void) {
+    ensure_core_mutexes();
+    hidpp_mutex_lock(&g_snap_lock);
+    g_topology_dirty = 1;
+    hidpp_mutex_unlock(&g_snap_lock);
+
+    hidpp_mutex_lock(&g_wake_lock);
+    g_wake_burst = 1;
+    hidpp_cond_broadcast(&g_wake_cv);
+    hidpp_mutex_unlock(&g_wake_lock);
+
+    hidpp_mutex_lock(&g_refresh_lock);
+    g_refresh_pending = 1;
+    hidpp_cond_broadcast(&g_refresh_cv);
+    hidpp_mutex_unlock(&g_refresh_lock);
+}
+
+static void hidpp_core_signal_feat_dirty(void) {
+    ensure_core_mutexes();
+    hidpp_mutex_lock(&g_snap_lock);
+    g_feat_cache_dirty = 1;
+    hidpp_mutex_unlock(&g_snap_lock);
 }
 
 static void wake_watcher_main(void *unused) {
@@ -1016,17 +1263,29 @@ static void wake_watcher_main(void *unused) {
 
         if (hidpp_core_is_stopping()) break;
 
-        hidpp_mutex_lock(&g_hid_lock);
-        int has_saved = g_has_saved;
-        hidpp_mutex_unlock(&g_hid_lock);
-        if (!has_saved) continue;
+        hidpp_mutex_lock(&g_snap_lock);
+        int dirty = (g_topology_dirty || g_feat_cache_dirty) ? 1 : 0;
+        hidpp_mutex_unlock(&g_snap_lock);
 
-        if (!burst) {
+        hidpp_mutex_lock(&g_hid_lock);
+        consume_dirty_flags_locked();
+        int has_saved = g_has_saved;
+        if (!has_saved) {
+            if (burst || dirty) {
+                (void)read_state_locked(1, 0);
+            }
+            hidpp_mutex_unlock(&g_hid_lock);
+            continue;
+        }
+        hidpp_mutex_unlock(&g_hid_lock);
+
+        if (!burst && !dirty) {
             uint64_t idle_ms = hidpp_plat_mouse_idle_ms();
             if (idle_ms == UINT64_MAX || idle_ms > 15000u) {
                 continue;
             }
             hidpp_mutex_lock(&g_hid_lock);
+            consume_dirty_flags_locked();
             int changed = 0;
             (void)ensure_dpi_fast_locked(0, &changed);
             hidpp_mutex_unlock(&g_hid_lock);
@@ -1038,13 +1297,13 @@ static void wake_watcher_main(void *unused) {
         for (int attempt = 0; attempt < 6; attempt++) {
             if (hidpp_core_is_stopping()) break;
             hidpp_mutex_lock(&g_hid_lock);
+            consume_dirty_flags_locked();
             restored = ensure_dpi_fast_locked(0, &changed);
             hidpp_mutex_unlock(&g_hid_lock);
             if (restored) {
-                /* Always bump rev after a successful wake restore if not already bumped */
+                /* Bump rev only without overwriting concurrent live state fields. */
                 if (!changed) {
-                    hidpp_state_t st = load_live_state();
-                    commit_state(&st, 1);
+                    bump_state_rev_only();
                 }
                 break;
             }
@@ -1070,6 +1329,7 @@ static void refresher_main(void *unused) {
         int pending_set = g_want_pending;
         int32_t dpi = g_want_dpi;
         int32_t lod = g_want_lod;
+        int32_t req_seq = g_want_seq;
         g_want_pending = 0;
         g_refresh_pending = 0;
         hidpp_mutex_unlock(&g_refresh_lock);
@@ -1077,12 +1337,13 @@ static void refresher_main(void *unused) {
         if (hidpp_core_is_stopping()) break;
 
         hidpp_mutex_lock(&g_hid_lock);
+        consume_dirty_flags_locked();
         if (pending_set) {
-            if (set_dpi_locked(dpi, dpi, lod, 1, 1) != 0) {
-                (void)read_state_locked(1);
+            if (set_dpi_locked(dpi, dpi, lod, 1, 1, req_seq) != 0) {
+                (void)read_state_locked(1, req_seq);
             }
         } else {
-            (void)read_state_locked(1);
+            (void)read_state_locked(1, 0);
         }
         hidpp_mutex_unlock(&g_hid_lock);
     }
@@ -1090,37 +1351,61 @@ static void refresher_main(void *unused) {
 
 static void hid_notify_main(void *unused) {
     (void)unused;
+    int ever_opened = 0;
+    char last_ep_id[HIDPP_ENDPOINT_ID_MAX];
+    last_ep_id[0] = '\0';
+
     while (!hidpp_core_is_stopping()) {
         hidpp_endpoint_info_t eps[HIDPP_MAX_ENDPOINTS];
         int perm_ignored = 0;
         int count = hidpp_plat_enumerate(eps, HIDPP_MAX_ENDPOINTS, &perm_ignored);
 
         hidpp_dev_t *dev = NULL;
+        const char *opened_id = NULL;
         for (int i = 0; i < count; i++) {
             if (eps[i].kind == HIDPP_KIND_LIGHTSPEED_RECEIVER ||
                 eps[i].kind == HIDPP_KIND_MULTI_RECEIVER) {
                 dev = hidpp_plat_open(eps[i].id, 1, &perm_ignored);
-                if (dev) break;
+                if (dev) {
+                    opened_id = eps[i].id;
+                    break;
+                }
             }
         }
         if (!dev && count > 0) {
             dev = hidpp_plat_open(eps[0].id, 1, &perm_ignored);
+            if (dev) opened_id = eps[0].id;
         }
         if (!dev) {
             hidpp_plat_sleep_ms(1000u);
             continue;
         }
 
+        if (ever_opened || (opened_id && last_ep_id[0] != '\0' && strcmp(last_ep_id, opened_id) != 0)) {
+            hidpp_core_signal_topology_change();
+        }
+        ever_opened = 1;
+        if (opened_id) {
+            size_t n = strlen(opened_id);
+            if (n >= sizeof(last_ep_id)) n = sizeof(last_ep_id) - 1;
+            memcpy(last_ep_id, opened_id, n);
+            last_ep_id[n] = '\0';
+        }
+
         while (!hidpp_core_is_stopping()) {
             uint8_t buf[64];
             memset(buf, 0, sizeof(buf));
             int got = hidpp_plat_read(dev, buf, sizeof(buf), 500);
-            if (got < 0) break;
+            if (got < 0) {
+                hidpp_core_signal_topology_change();
+                break;
+            }
             if (got == 0) continue;
             if (got >= HIDPP_SHORT_LEN &&
                 (buf[0] == HIDPP_SHORT_REPORT_ID || buf[0] == HIDPP_LONG_REPORT_ID) &&
                 buf[2] == 0x41u &&
                 ((buf[4] & 0x40u) == 0u)) {
+                hidpp_core_signal_feat_dirty();
                 hidpp_core_signal_wake();
             }
         }
@@ -1133,23 +1418,27 @@ static void hid_notify_main(void *unused) {
 }
 
 static void start_watchers_once(void) {
+    ensure_core_mutexes();
+    hidpp_mutex_lock(&g_life_lock);
     hidpp_mutex_lock(&g_snap_lock);
-    if (g_watchers_started || g_stopping) {
-        hidpp_mutex_unlock(&g_snap_lock);
+    int stop = g_stopping;
+    hidpp_mutex_unlock(&g_snap_lock);
+
+    if (g_watchers_started || stop) {
+        hidpp_mutex_unlock(&g_life_lock);
         return;
     }
     g_watchers_started = 1;
-    hidpp_mutex_unlock(&g_snap_lock);
-
     hidpp_plat_start_watchers();
     g_th_wake_valid = hidpp_thread_start(&g_th_wake, wake_watcher_main, NULL);
     g_th_refresh_valid = hidpp_thread_start(&g_th_refresh, refresher_main, NULL);
     if (hidpp_plat_needs_notify_thread()) {
         g_th_notify_valid = hidpp_thread_start(&g_th_notify, hid_notify_main, NULL);
     }
+    hidpp_mutex_unlock(&g_life_lock);
 }
 
-/* ---- Exported C ABI (24 symbols) ---- */
+/* ---- Exported C ABI (28 symbols) ---- */
 
 int32_t mousedpi_started_hidden(void) {
     ensure_core_init();
@@ -1159,6 +1448,11 @@ int32_t mousedpi_started_hidden(void) {
 int32_t mousedpi_can_hide_to_tray(void) {
     ensure_core_init();
     return hidpp_plat_can_hide_to_tray();
+}
+
+int32_t mousedpi_wait_tray_ready(int32_t timeout_ms) {
+    ensure_core_init();
+    return hidpp_plat_wait_tray_ready(timeout_ms);
 }
 
 int32_t mousedpi_peek_config(int32_t which) {
@@ -1182,14 +1476,22 @@ int32_t mousedpi_init_and_restore(void) {
     if (cfg_lod < 1 || cfg_lod > 3) cfg_lod = HIDPP_DEFAULT_LOD;
 
     hidpp_mutex_lock(&g_hid_lock);
-    int32_t ok = read_state_locked(0);
+    int32_t ok = read_state_locked(0, 0);
     if (has_cfg && cfg_dpi >= HIDPP_MIN_DPI && cfg_dpi <= HIDPP_MAX_DPI) {
         g_has_saved = 1;
         g_saved_dpi = cfg_dpi;
         g_saved_lod = cfg_lod;
         hidpp_state_t st = load_live_state();
-        if (ok && (st.dpi_x != cfg_dpi || st.dpi_y != cfg_dpi || st.lod != cfg_lod)) {
-            (void)set_dpi_locked(cfg_dpi, cfg_dpi, cfg_lod, 0, 0);
+        int y_mismatch = g_cached_has_indep_y && (st.dpi_y != cfg_dpi);
+        int lod_mismatch = g_cached_has_lod && (st.lod != cfg_lod);
+        if (ok && (st.dpi_x != cfg_dpi || y_mismatch || lod_mismatch)) {
+            if (set_dpi_locked(cfg_dpi, cfg_dpi, cfg_lod, 0, 0, 0) == 0) {
+                hidpp_state_t confirmed = load_live_state();
+                g_saved_dpi = confirmed.dpi_x;
+                g_saved_lod = confirmed.lod;
+            }
+        } else if (ok && !g_cached_has_lod) {
+            g_saved_lod = st.lod;
         }
     } else if (ok) {
         hidpp_state_t st = load_live_state();
@@ -1213,15 +1515,26 @@ void mousedpi_request_refresh(void) {
     hidpp_mutex_unlock(&g_refresh_lock);
 }
 
-void mousedpi_request_set(int32_t dpi, int32_t lod) {
+static void request_set_internal(int32_t seq, int has_seq, int32_t dpi, int32_t lod) {
     ensure_core_init();
     start_watchers_once();
     hidpp_mutex_lock(&g_refresh_lock);
     g_want_pending = 1;
     g_want_dpi = dpi;
     g_want_lod = lod;
+    if (has_seq && seq > g_want_seq) {
+        g_want_seq = seq;
+    }
     hidpp_cond_broadcast(&g_refresh_cv);
     hidpp_mutex_unlock(&g_refresh_lock);
+}
+
+void mousedpi_request_set(int32_t dpi, int32_t lod) {
+    request_set_internal(0, 0, dpi, lod);
+}
+
+void mousedpi_request_set_seq(int32_t seq, int32_t dpi, int32_t lod) {
+    request_set_internal(seq, 1, dpi, lod);
 }
 
 void mousedpi_request_wake_restore(void) {
@@ -1250,11 +1563,11 @@ int32_t mousedpi_wait_rev(int32_t seen) {
 }
 
 void mousedpi_stop_waits(void) {
-    if (!g_inited) return;
+    ensure_core_mutexes();
+    hidpp_mutex_lock(&g_life_lock);
+
     hidpp_mutex_lock(&g_snap_lock);
     g_stopping = 1;
-    int started = g_watchers_started;
-    g_watchers_started = 0;
     hidpp_cond_broadcast(&g_rev_cv);
     hidpp_mutex_unlock(&g_snap_lock);
 
@@ -1266,22 +1579,26 @@ void mousedpi_stop_waits(void) {
     hidpp_cond_broadcast(&g_refresh_cv);
     hidpp_mutex_unlock(&g_refresh_lock);
 
+    int join_wake = g_th_wake_valid;
+    hidpp_thread_t th_wake = g_th_wake;
+    g_th_wake_valid = 0;
+
+    int join_refresh = g_th_refresh_valid;
+    hidpp_thread_t th_refresh = g_th_refresh;
+    g_th_refresh_valid = 0;
+
+    int join_notify = g_th_notify_valid;
+    hidpp_thread_t th_notify = g_th_notify;
+    g_th_notify_valid = 0;
+
+    g_watchers_started = 0;
+    hidpp_mutex_unlock(&g_life_lock);
+
     hidpp_plat_stop_watchers();
 
-    if (started) {
-        if (g_th_wake_valid) {
-            hidpp_thread_join(g_th_wake);
-            g_th_wake_valid = 0;
-        }
-        if (g_th_refresh_valid) {
-            hidpp_thread_join(g_th_refresh);
-            g_th_refresh_valid = 0;
-        }
-        if (g_th_notify_valid) {
-            hidpp_thread_join(g_th_notify);
-            g_th_notify_valid = 0;
-        }
-    }
+    if (join_wake) hidpp_thread_join(th_wake);
+    if (join_refresh) hidpp_thread_join(th_refresh);
+    if (join_notify) hidpp_thread_join(th_notify);
 }
 
 int32_t mousedpi_get_connected(void) {
@@ -1331,6 +1648,22 @@ void mousedpi_snapshot_capture(void) {
     hidpp_mutex_lock(&g_snap_lock);
     g_frozen_snap = g_live_state;
     hidpp_mutex_unlock(&g_snap_lock);
+}
+
+int32_t mousedpi_snap_rev(void) {
+    ensure_core_init();
+    hidpp_mutex_lock(&g_snap_lock);
+    int32_t v = g_frozen_snap.rev;
+    hidpp_mutex_unlock(&g_snap_lock);
+    return v;
+}
+
+int32_t mousedpi_snap_applied_seq(void) {
+    ensure_core_init();
+    hidpp_mutex_lock(&g_snap_lock);
+    int32_t v = g_frozen_snap.applied_seq;
+    hidpp_mutex_unlock(&g_snap_lock);
+    return v;
 }
 
 int32_t mousedpi_snap_connected(void) {
@@ -1391,31 +1724,38 @@ char *mousedpi_picture_path_dup(void) {
 #ifdef HIDPP_CORE_TEST
 /* Reset helper for isolated unit tests */
 static void hidpp_core_test_reset(void) {
-    if (g_inited) {
-        mousedpi_stop_waits();
-        hidpp_mutex_lock(&g_hid_lock);
-        invalidate_cache_locked();
-        g_notif_enabled_gen = 0;
-        g_has_saved = 0;
-        g_saved_dpi = HIDPP_DEFAULT_DPI;
-        g_saved_lod = HIDPP_DEFAULT_LOD;
-        hidpp_mutex_unlock(&g_hid_lock);
+    ensure_core_mutexes();
+    mousedpi_stop_waits();
 
-        hidpp_mutex_lock(&g_snap_lock);
-        init_default_state(&g_live_state);
-        init_default_state(&g_frozen_snap);
-        g_stopping = 0;
-        g_watchers_started = 0;
-        hidpp_mutex_unlock(&g_snap_lock);
+    hidpp_mutex_lock(&g_life_lock);
+    hidpp_mutex_lock(&g_hid_lock);
+    invalidate_cache_locked();
+    g_last_read_gen = 0;
+    g_notif_enabled_gen = 0;
+    g_has_saved = 0;
+    g_saved_dpi = HIDPP_DEFAULT_DPI;
+    g_saved_lod = HIDPP_DEFAULT_LOD;
+    hidpp_mutex_unlock(&g_hid_lock);
 
-        hidpp_mutex_lock(&g_wake_lock);
-        g_wake_burst = 0;
-        hidpp_mutex_unlock(&g_wake_lock);
+    hidpp_mutex_lock(&g_snap_lock);
+    init_default_state(&g_live_state);
+    init_default_state(&g_frozen_snap);
+    g_stopping = 0;
+    g_topology_dirty = 0;
+    g_feat_cache_dirty = 0;
+    hidpp_mutex_unlock(&g_snap_lock);
 
-        hidpp_mutex_lock(&g_refresh_lock);
-        g_refresh_pending = 0;
-        g_want_pending = 0;
-        hidpp_mutex_unlock(&g_refresh_lock);
-    }
+    hidpp_mutex_lock(&g_wake_lock);
+    g_wake_burst = 0;
+    hidpp_mutex_unlock(&g_wake_lock);
+
+    hidpp_mutex_lock(&g_refresh_lock);
+    g_refresh_pending = 0;
+    g_want_pending = 0;
+    g_want_seq = 0;
+    hidpp_mutex_unlock(&g_refresh_lock);
+
+    g_watchers_started = 0;
+    hidpp_mutex_unlock(&g_life_lock);
 }
 #endif
