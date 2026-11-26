@@ -1,0 +1,301 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PION_REV: 585688d11bc507ddd86768ba46631308065f1adb
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "APP_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned invar
+        run: sh tools/deps.sh
+
+      - name: Checkout pinned pion
+        uses: actions/checkout@v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ env.PION_REV }}
+          path: _pion
+          persist-credentials: false
+
+      - name: Cache pion toolchain (macOS arm64)
+        id: pion-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _pion/out/pionc2
+            _pion/out/qbe
+            _pion/out/libpionrt.a
+          key: pion-macos-arm64-${{ env.PION_REV }}
+
+      - name: Bootstrap pionc2 (macOS arm64)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          OUT_DIR="$PWD/_pion/out"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
+          sh _pion/scripts/build-qbe.sh "$PION_QBE"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c _pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c _pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+          gzip -dc _pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/seed.ssa"
+          "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$TMP_DIR/seed.ssa"
+          cc "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$TMP_DIR/pionc0"
+          PION_RT_LIB="$PION_RT_CLI_LIB" "$TMP_DIR/pionc0" build -o "$TMP_DIR/pionc1" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+          PION_RT_LIB="$PION_RT_CLI_LIB" "$TMP_DIR/pionc1" build -o "$OUT_DIR/pionc2" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+
+      - name: Build & package macOS arm64 app
+        run: |
+          set -eu
+          export PIONC="$PWD/_pion/out/pionc2"
+          export PION_QBE="$PWD/_pion/out/qbe"
+          export PION_RT_LIB="$PWD/_pion/out/libpionrt.a"
+          sh tools/build-macos.sh
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent out/MouseDPI.app "release/MouseDPI-macos-arm64-${RELEASE_TAG}.zip"
+          ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release/*.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Install Linux host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libsoup-3.0-dev \
+            libepoxy-dev \
+            libpango1.0-dev \
+            libfontconfig1-dev \
+            libgdk-pixbuf-2.0-dev \
+            zlib1g-dev \
+            pkg-config
+
+      - name: Fetch pinned invar
+        run: sh tools/deps.sh
+
+      - name: Checkout pinned pion
+        uses: actions/checkout@v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ env.PION_REV }}
+          path: _pion
+          persist-credentials: false
+
+      - name: Cache pion toolchain (Linux x86_64)
+        id: pion-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _pion/out/pionc2
+            _pion/out/qbe
+            _pion/out/libpionrt.a
+          key: pion-linux-x86_64-${{ env.PION_REV }}
+
+      - name: Bootstrap pionc2 (Linux x86_64)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          OUT_DIR="$PWD/_pion/out"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export CC=cc
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
+          sh _pion/scripts/build-qbe.sh "$PION_QBE"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c _pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c _pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+          gzip -dc _pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/seed.ssa"
+          "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$TMP_DIR/seed.ssa"
+          cc "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$TMP_DIR/pionc0"
+          PION_RT_LIB="$PION_RT_CLI_LIB" "$TMP_DIR/pionc0" build -o "$TMP_DIR/pionc1" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+          PION_RT_LIB="$PION_RT_CLI_LIB" "$TMP_DIR/pionc1" build -o "$OUT_DIR/pionc2" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+
+      - name: Build & package Linux x64 archive
+        run: |
+          set -eu
+          export PIONC="$PWD/_pion/out/pionc2"
+          export PION_QBE="$PWD/_pion/out/qbe"
+          export PION_RT_LIB="$PWD/_pion/out/libpionrt.a"
+          sh tools/build-linux.sh
+          PKG="MouseDPI-linux-x64-${RELEASE_TAG}"
+          STAGE="release/$PKG"
+          mkdir -p "$STAGE/assets"
+          cp out/mousedpi "$STAGE/mousedpi"
+          chmod +x "$STAGE/mousedpi"
+          cp assets/mouse.png "$STAGE/mouse.png"
+          cp assets/mouse.png assets/icon-256.png assets/com.zzj3720.MouseDPI.desktop assets/70-logi-dpi.rules "$STAGE/assets/"
+          cp tools/install-linux.sh "$STAGE/install-linux.sh"
+          chmod +x "$STAGE/install-linux.sh"
+          tar -C release -czf "release/${PKG}.tar.gz" "$PKG"
+          rm -rf "$STAGE"
+          ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release/*.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned invar & WebView2
+        run: sh tools/deps.sh
+
+      - name: Checkout pinned pion
+        uses: actions/checkout@v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ env.PION_REV }}
+          path: _pion
+          persist-credentials: false
+
+      - name: Cache pion toolchain (Windows x64)
+        id: pion-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _pion/out/pionc2.exe
+            _pion/out/qbe.exe
+            _pion/out/libpionrt.a
+          key: pion-windows-x64-${{ env.PION_REV }}
+
+      - name: Bootstrap pionc2.exe (Windows x64 MinGW)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          OUT_DIR="$PWD/_pion/out"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          CC=gcc
+          CC="$CC" sh _pion/scripts/build-qbe.sh "$OUT_DIR/qbe.exe"
+          "$CC" -std=c11 -O2 -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+            -Wall -Wextra -Werror -c _pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
+          "$CC" -std=c11 -O2 -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+            -Wall -Wextra -Werror -c _pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+          gzip -dc _pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/seed.ssa"
+          "$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/pionc0.s" "$TMP_DIR/seed.ssa"
+          "$CC" -Wa,-mbig-obj -c "$TMP_DIR/pionc0.s" -o "$TMP_DIR/pionc0.o"
+          "$CC" "$TMP_DIR/pionc0.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$TMP_DIR/pionc0.exe"
+          export PION_QBE="$OUT_DIR/qbe.exe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_TARGET=amd64_win "$TMP_DIR/pionc0.exe" build --emit-obj "$TMP_DIR/pionc1.o" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+          "$CC" "$TMP_DIR/pionc1.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$TMP_DIR/pionc1.exe"
+          PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" "$TMP_DIR/pionc1.exe" build -o "$OUT_DIR/pionc2.exe" _pion/compiler/src/core _pion/compiler/src/cli/main.pion
+
+      - name: Build & package Windows x64 zip
+        run: |
+          set -eu
+          export PIONC="$PWD/_pion/out/pionc2.exe"
+          export PION_QBE="$PWD/_pion/out/qbe.exe"
+          export PION_RT_LIB="$PWD/_pion/out/libpionrt.a"
+          export PION_SRC="$PWD/_pion"
+          LLVM_BIN="/c/Program Files/LLVM/bin" sh tools/build-win.sh
+          mkdir -p release
+          powershell -NoProfile -Command "Compress-Archive -Path out/MouseDPI.exe,out/mouse.png -DestinationPath release/MouseDPI-win-x64-${RELEASE_TAG}.zip -Force"
+          ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release/*.zip
+
+  publish:
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all platform packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          (cd release && sha256sum MouseDPI-* > SHA256SUMS.txt)
+          ls -lh release/
+          cat release/SHA256SUMS.txt
+          {
+            echo "## MouseDPI ${TAG}"
+            echo ""
+            echo "Upgraded to latest \`AFK-surf/invar\` (\`0947166\`) with native desktop support for **macOS (arm64)**, **Windows (x64)**, and **Linux (x64)**."
+            echo ""
+            echo "### Downloads"
+            echo "- **macOS (Apple Silicon / arm64)**: \`MouseDPI-macos-arm64-${TAG}.zip\` (unzip and drag \`MouseDPI.app\` to Applications; grant Input Monitoring on first launch)"
+            echo "- **Windows (x64)**: \`MouseDPI-win-x64-${TAG}.zip\` (unzip and run \`MouseDPI.exe\`)"
+            echo "- **Linux (x64)**: \`MouseDPI-linux-x64-${TAG}.tar.gz\` (unpack and run \`./mousedpi\`, or run \`sh install-linux.sh\` to install desktop entry + udev rules)"
+          } > release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* \
+              --title "${TAG} - Latest Invar & macOS / Linux / Windows Support" \
+              --notes-file release-notes.md
+          fi

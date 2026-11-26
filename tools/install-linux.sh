@@ -4,7 +4,16 @@
 set -e
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
-BIN="$ROOT/out/mousedpi"
+if [ -x "$ROOT/out/mousedpi" ]; then
+  BIN="$ROOT/out/mousedpi"
+elif [ -x "$ROOT/mousedpi" ]; then
+  BIN="$ROOT/mousedpi"
+elif [ -x "$(dirname -- "$0")/mousedpi" ]; then
+  ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+  BIN="$ROOT/mousedpi"
+else
+  BIN="$ROOT/out/mousedpi"
+fi
 
 if [ ! -x "$BIN" ]; then
   echo "install-linux: $BIN not found; run 'sh tools/build-linux.sh' first" >&2

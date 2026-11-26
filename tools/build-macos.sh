@@ -33,7 +33,8 @@ if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
   rm -rf "$ICONSET"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'EOF'
+APP_VERSION="${APP_VERSION:-0.3.0}"
+cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -55,7 +56,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.5.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
@@ -67,5 +68,10 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+
+# Ad-hoc sign the app bundle so Apple Silicon executes it cleanly out of the box.
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "$APP"
+fi
 
 echo "built $OUT/MouseDPI and $APP"
