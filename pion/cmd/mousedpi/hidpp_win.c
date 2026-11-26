@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <devpropdef.h>
 #include <powrprof.h>
 
 #include "hidpp_platform.h"
@@ -25,13 +26,15 @@
 #endif
 
 struct hidpp_dev {
-    HANDLE h;
-    USHORT in_len;
-    USHORT out_len;
-    HANDLE h_short;
-    USHORT short_in_len;
-    USHORT short_out_len;
-    int    notify_only;
+    HANDLE  h;
+    USHORT  in_len;
+    USHORT  out_len;
+    HANDLE  h_short;
+    USHORT  short_in_len;
+    USHORT  short_out_len;
+    int     notify_only;
+    uint8_t pend_buf[64];
+    int     pend_len;
 };
 
 static int             g_win_inited = 0;
@@ -40,11 +43,13 @@ static char            g_exe_dir[MAX_PATH]  = {0};
 static char            g_cfg_path[MAX_PATH] = {0};
 
 static volatile LONG64 g_last_mouse_tick = 0;
+static SRWLOCK         g_raw_lock = SRWLOCK_INIT;
 static int             g_win_watchers_started = 0;
+static int             g_raw_stopping = 0;
 static HPOWERNOTIFY    g_power_notify = NULL;
 static HANDLE          g_raw_thread = NULL;
 static HANDLE          g_raw_ready_ev = NULL;
-static volatile HWND   g_raw_hwnd = NULL;
+static HWND            g_raw_hwnd = NULL;
 
 void hidpp_plat_init(void) {
     if (g_win_inited) return;
@@ -239,23 +244,79 @@ static int path_has_prefix_ci(const char *path, const char *prefix) {
     return (path[i] == '\0' || path[i] == '&' || path[i] == '#') ? 1 : 0;
 }
 
+/* DEVPKEY_Device_ContainerId = {8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c}, pid = 2 */
+static const DEVPROPKEY kDevPkeyContainerId = {
+    { 0x8c7ed206u, 0x3f8au, 0x4827u, { 0xb3u, 0xabu, 0xaeu, 0x9eu, 0x1fu, 0xaeu, 0xfcu, 0x6cu } },
+    2u
+};
+
+static int str_eq_ci(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0') ? 1 : 0;
+}
+
+static int guid_is_nonzero(const GUID *g) {
+    const uint8_t *p = (const uint8_t *)g;
+    for (size_t i = 0; i < sizeof(*g); i++) {
+        if (p[i] != 0) return 1;
+    }
+    return 0;
+}
+
+static int get_dev_container_id(HDEVINFO info, SP_DEVINFO_DATA *devinfo, GUID *out_cid) {
+    if (!devinfo || !out_cid) return 0;
+    DEVPROPTYPE ptype = 0;
+    DWORD req = 0;
+    GUID cid;
+    memset(&cid, 0, sizeof(cid));
+    if (!SetupDiGetDevicePropertyW(
+            info,
+            devinfo,
+            &kDevPkeyContainerId,
+            &ptype,
+            (PBYTE)&cid,
+            (DWORD)sizeof(cid),
+            &req,
+            0)) {
+        return 0;
+    }
+    if (ptype != DEVPROP_TYPE_GUID || req != sizeof(GUID) || !guid_is_nonzero(&cid)) {
+        return 0;
+    }
+    *out_cid = cid;
+    return 1;
+}
+
 static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_access,
                                         USHORT *out_in_len, USHORT *out_out_len) {
     if (!endpoint_id || !endpoint_id[0]) return INVALID_HANDLE_VALUE;
 
+    uint16_t want_vid = 0, want_pid = 0;
+    if (!parse_hex4_after(endpoint_id, "vid_", &want_vid) ||
+        !parse_hex4_after(endpoint_id, "pid_", &want_pid)) {
+        return INVALID_HANDLE_VALUE;
+    }
+
     char prefix[HIDPP_ENDPOINT_ID_MAX];
     extract_dev_prefix(endpoint_id, prefix, sizeof(prefix));
-    if (!prefix[0]) return INVALID_HANDLE_VALUE;
 
     GUID hid_guid;
     HidD_GetHidGuid(&hid_guid);
     HDEVINFO info = SetupDiGetClassDevsA(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (info == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 
+    /* Pass 1: resolve DEVPKEY_Device_ContainerId of the exact target endpoint_id. */
+    GUID target_cid;
+    memset(&target_cid, 0, sizeof(target_cid));
+    int has_target_cid = 0;
+
     SP_DEVICE_INTERFACE_DATA did;
     did.cbSize = sizeof(did);
-    HANDLE found = INVALID_HANDLE_VALUE;
-
     for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(info, NULL, &hid_guid, idx, &did); idx++) {
         DWORD req = 0;
         SetupDiGetDeviceInterfaceDetailA(info, &did, NULL, 0, &req, NULL);
@@ -264,8 +325,52 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
             (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, req);
         if (!det) continue;
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-        if (SetupDiGetDeviceInterfaceDetailA(info, &did, det, req, NULL, NULL)) {
-            if (path_has_prefix_ci(det->DevicePath, prefix)) {
+        SP_DEVINFO_DATA devinfo;
+        memset(&devinfo, 0, sizeof(devinfo));
+        devinfo.cbSize = sizeof(devinfo);
+        if (SetupDiGetDeviceInterfaceDetailA(info, &did, det, req, NULL, &devinfo)) {
+            if (str_eq_ci(det->DevicePath, endpoint_id)) {
+                has_target_cid = get_dev_container_id(info, &devinfo, &target_cid);
+                HeapFree(GetProcessHeap(), 0, det);
+                break;
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, det);
+    }
+
+    /* Pass 2: find the 7-byte short HID++ TLC belonging to the SAME physical device
+     * (matching ContainerId GUID + vid_ + pid_; never fall back to cross-device PID matching). */
+    HANDLE found = INVALID_HANDLE_VALUE;
+    did.cbSize = sizeof(did);
+    for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(info, NULL, &hid_guid, idx, &did); idx++) {
+        DWORD req = 0;
+        SetupDiGetDeviceInterfaceDetailA(info, &did, NULL, 0, &req, NULL);
+        if (req == 0) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_A *det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, req);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+        SP_DEVINFO_DATA devinfo;
+        memset(&devinfo, 0, sizeof(devinfo));
+        devinfo.cbSize = sizeof(devinfo);
+        if (SetupDiGetDeviceInterfaceDetailA(info, &did, det, req, NULL, &devinfo)) {
+            uint16_t vid = 0, pid = 0;
+            int id_ok = parse_hex4_after(det->DevicePath, "vid_", &vid) && vid == want_vid &&
+                        parse_hex4_after(det->DevicePath, "pid_", &pid) && pid == want_pid;
+            int dev_match = 0;
+            if (id_ok) {
+                if (has_target_cid) {
+                    GUID cand_cid;
+                    if (get_dev_container_id(info, &devinfo, &cand_cid) &&
+                        memcmp(&cand_cid, &target_cid, sizeof(GUID)) == 0) {
+                        dev_match = 1;
+                    }
+                } else if (prefix[0] && path_has_prefix_ci(det->DevicePath, prefix)) {
+                    dev_match = 1;
+                }
+            }
+
+            if (dev_match) {
                 HANDLE probe = CreateFileA(
                     det->DevicePath,
                     0,
@@ -283,7 +388,7 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
                         if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS &&
                             caps.UsagePage == HIDPP_USAGE_PAGE_VENDOR &&
                             caps.InputReportByteLength == HIDPP_SHORT_LEN &&
-                            caps.OutputReportByteLength == HIDPP_SHORT_LEN) {
+                            (desired_access == GENERIC_READ || caps.OutputReportByteLength == HIDPP_SHORT_LEN)) {
                             is_short = 1;
                             in_l = caps.InputReportByteLength;
                             out_l = caps.OutputReportByteLength;
@@ -318,77 +423,6 @@ static HANDLE open_short_tlc_for_device(const char *endpoint_id, DWORD desired_a
     return found;
 }
 
-static HANDLE open_notify_short_handle(uint16_t want_pid, USHORT want_in_len, USHORT *out_in_len) {
-    GUID hid_guid;
-    HidD_GetHidGuid(&hid_guid);
-    HDEVINFO info = SetupDiGetClassDevsA(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (info == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
-
-    SP_DEVICE_INTERFACE_DATA did;
-    did.cbSize = sizeof(did);
-    HANDLE found = INVALID_HANDLE_VALUE;
-
-    for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(info, NULL, &hid_guid, idx, &did); idx++) {
-        DWORD req = 0;
-        SetupDiGetDeviceInterfaceDetailA(info, &did, NULL, 0, &req, NULL);
-        if (req == 0) continue;
-        SP_DEVICE_INTERFACE_DETAIL_DATA_A *det =
-            (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, req);
-        if (!det) continue;
-        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-        if (SetupDiGetDeviceInterfaceDetailA(info, &did, det, req, NULL, NULL)) {
-            uint16_t vid = 0, pid = 0;
-            if (parse_hex4_after(det->DevicePath, "vid_", &vid) && vid == HIDPP_VID_LOGITECH &&
-                (want_pid == 0 || (parse_hex4_after(det->DevicePath, "pid_", &pid) && pid == want_pid))) {
-                HANDLE probe = CreateFileA(
-                    det->DevicePath,
-                    0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    NULL,
-                    OPEN_EXISTING,
-                    0,
-                    NULL);
-                if (probe != INVALID_HANDLE_VALUE) {
-                    int match = 0;
-                    USHORT in_l = 0;
-                    PHIDP_PREPARSED_DATA ppd = NULL;
-                    if (HidD_GetPreparsedData(probe, &ppd)) {
-                        HIDP_CAPS caps;
-                        if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS &&
-                            caps.UsagePage == HIDPP_USAGE_PAGE_VENDOR &&
-                            caps.InputReportByteLength == want_in_len) {
-                            match = 1;
-                            in_l = caps.InputReportByteLength;
-                        }
-                        HidD_FreePreparsedData(ppd);
-                    }
-                    CloseHandle(probe);
-
-                    if (match) {
-                        HANDLE h = CreateFileA(
-                            det->DevicePath,
-                            GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            NULL,
-                            OPEN_EXISTING,
-                            FILE_FLAG_OVERLAPPED,
-                            NULL);
-                        if (h != INVALID_HANDLE_VALUE) {
-                            *out_in_len = in_l;
-                            HeapFree(GetProcessHeap(), 0, det);
-                            found = h;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        HeapFree(GetProcessHeap(), 0, det);
-    }
-    SetupDiDestroyDeviceInfoList(info);
-    return found;
-}
-
 hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_perm_denied) {
     if (out_perm_denied) *out_perm_denied = 0;
 
@@ -400,15 +434,8 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     USHORT short_out_len = HIDPP_SHORT_LEN;
 
     if (notify_only) {
-        /* Prefer the 7-byte short HID++ TLC on the SAME physical device where 0x41 arrives. */
+        /* Prefer the 7-byte short HID++ TLC on the SAME physical device (matched by ContainerId). */
         h = open_short_tlc_for_device(endpoint_id, GENERIC_READ, &in_len, &out_len);
-        if (h == INVALID_HANDLE_VALUE) {
-            uint16_t want_pid = 0;
-            if (endpoint_id && endpoint_id[0]) {
-                (void)parse_hex4_after(endpoint_id, "pid_", &want_pid);
-            }
-            h = open_notify_short_handle(want_pid, HIDPP_SHORT_LEN, &in_len);
-        }
         if (h == INVALID_HANDLE_VALUE && endpoint_id && endpoint_id[0]) {
             h = CreateFileA(
                 endpoint_id,
@@ -452,7 +479,7 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
             endpoint_id, GENERIC_READ | GENERIC_WRITE, &short_in_len, &short_out_len);
     }
 
-    hidpp_dev_t *dev = (hidpp_dev_t *)malloc(sizeof(*dev));
+    hidpp_dev_t *dev = (hidpp_dev_t *)calloc(1, sizeof(*dev));
     if (!dev) {
         CloseHandle(h);
         if (h_short != INVALID_HANDLE_VALUE) CloseHandle(h_short);
@@ -465,6 +492,7 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     dev->short_in_len = short_in_len;
     dev->short_out_len = short_out_len;
     dev->notify_only = notify_only ? 1 : 0;
+    dev->pend_len = 0;
     return dev;
 }
 
@@ -477,6 +505,7 @@ void hidpp_plat_close(hidpp_dev_t *dev) {
 
 void hidpp_plat_drain(hidpp_dev_t *dev) {
     if (!dev) return;
+    dev->pend_len = 0;
     if (dev->h != INVALID_HANDLE_VALUE) (void)HidD_FlushQueue(dev->h);
     if (dev->h_short != INVALID_HANDLE_VALUE) (void)HidD_FlushQueue(dev->h_short);
 }
@@ -571,8 +600,24 @@ static int read_single_overlapped(HANDLE h, USHORT in_len, uint8_t *buf, size_t 
     return rc;
 }
 
+static void stash_pending_frame(hidpp_dev_t *dev, const uint8_t *src, DWORD len) {
+    if (!dev || !src || len == 0) return;
+    size_t cpy = (size_t)len;
+    if (cpy > sizeof(dev->pend_buf)) cpy = sizeof(dev->pend_buf);
+    memcpy(dev->pend_buf, src, cpy);
+    dev->pend_len = (int)cpy;
+}
+
 int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) {
     if (!dev || dev->h == INVALID_HANDLE_VALUE || !buf || cap == 0) return -1;
+
+    if (dev->pend_len > 0) {
+        size_t cpy = (size_t)dev->pend_len;
+        if (cpy > cap) cpy = cap;
+        memcpy(buf, dev->pend_buf, cpy);
+        dev->pend_len = 0;
+        return (int)cpy;
+    }
 
     if (dev->h_short == INVALID_HANDLE_VALUE || dev->notify_only) {
         return read_single_overlapped(dev->h, dev->in_len, buf, cap, timeout_ms);
@@ -614,7 +659,9 @@ int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) 
     if (ok_s) {
         if (pend_l) {
             CancelIoEx(dev->h, &ov_l);
-            (void)GetOverlappedResult(dev->h, &ov_l, &got_l, TRUE);
+            if (GetOverlappedResult(dev->h, &ov_l, &got_l, TRUE) && got_l > 0) {
+                stash_pending_frame(dev, b_long, got_l);
+            }
         }
         size_t cpy = got_s > (DWORD)cap ? cap : (size_t)got_s;
         memcpy(buf, b_short, cpy);
@@ -631,20 +678,34 @@ int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) 
         DWORD w = WaitForMultipleObjects(2, evs, FALSE, wait_ms);
         if (w == WAIT_OBJECT_0) {
             CancelIoEx(dev->h_short, &ov_s);
-            (void)GetOverlappedResult(dev->h_short, &ov_s, &got_s, TRUE);
-            if (GetOverlappedResult(dev->h, &ov_l, &got_l, FALSE)) {
+            BOOL fin_s = GetOverlappedResult(dev->h_short, &ov_s, &got_s, TRUE);
+            if (GetOverlappedResult(dev->h, &ov_l, &got_l, FALSE) && got_l > 0) {
+                if (fin_s && got_s > 0) {
+                    stash_pending_frame(dev, b_short, got_s);
+                }
                 size_t cpy = got_l > (DWORD)cap ? cap : (size_t)got_l;
                 memcpy(buf, b_long, cpy);
+                rc = (int)cpy;
+            } else if (fin_s && got_s > 0) {
+                size_t cpy = got_s > (DWORD)cap ? cap : (size_t)got_s;
+                memcpy(buf, b_short, cpy);
                 rc = (int)cpy;
             } else {
                 rc = -1;
             }
         } else if (w == WAIT_OBJECT_0 + 1) {
             CancelIoEx(dev->h, &ov_l);
-            (void)GetOverlappedResult(dev->h, &ov_l, &got_l, TRUE);
-            if (GetOverlappedResult(dev->h_short, &ov_s, &got_s, FALSE)) {
+            BOOL fin_l = GetOverlappedResult(dev->h, &ov_l, &got_l, TRUE);
+            if (GetOverlappedResult(dev->h_short, &ov_s, &got_s, FALSE) && got_s > 0) {
+                if (fin_l && got_l > 0) {
+                    stash_pending_frame(dev, b_long, got_l);
+                }
                 size_t cpy = got_s > (DWORD)cap ? cap : (size_t)got_s;
                 memcpy(buf, b_short, cpy);
+                rc = (int)cpy;
+            } else if (fin_l && got_l > 0) {
+                size_t cpy = got_l > (DWORD)cap ? cap : (size_t)got_l;
+                memcpy(buf, b_long, cpy);
                 rc = (int)cpy;
             } else {
                 rc = -1;
@@ -655,6 +716,9 @@ int hidpp_plat_read(hidpp_dev_t *dev, uint8_t *buf, size_t cap, int timeout_ms) 
             BOOL fin_l = GetOverlappedResult(dev->h, &ov_l, &got_l, TRUE);
             BOOL fin_s = GetOverlappedResult(dev->h_short, &ov_s, &got_s, TRUE);
             if (fin_l && got_l > 0) {
+                if (fin_s && got_s > 0) {
+                    stash_pending_frame(dev, b_short, got_s);
+                }
                 size_t cpy = got_l > (DWORD)cap ? cap : (size_t)got_l;
                 memcpy(buf, b_long, cpy);
                 rc = (int)cpy;
@@ -749,8 +813,8 @@ static LRESULT CALLBACK raw_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static DWORD WINAPI raw_input_thread(LPVOID unused) {
-    (void)unused;
+static DWORD WINAPI raw_input_thread(LPVOID param) {
+    HANDLE ready_ev = (HANDLE)param;
     WNDCLASSW wc;
     memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = raw_wndproc;
@@ -760,10 +824,22 @@ static DWORD WINAPI raw_input_thread(LPVOID unused) {
 
     HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
     if (!h) {
-        if (g_raw_ready_ev) SetEvent(g_raw_ready_ev);
+        if (ready_ev) SetEvent(ready_ev);
         return 0;
     }
-    g_raw_hwnd = h;
+
+    AcquireSRWLockExclusive(&g_raw_lock);
+    int stopping = g_raw_stopping;
+    if (!stopping) {
+        g_raw_hwnd = h;
+    }
+    ReleaseSRWLockExclusive(&g_raw_lock);
+
+    if (stopping) {
+        DestroyWindow(h);
+        if (ready_ev) SetEvent(ready_ev);
+        return 0;
+    }
 
     RAWINPUTDEVICE rid;
     rid.usUsagePage = 0x01;
@@ -772,7 +848,7 @@ static DWORD WINAPI raw_input_thread(LPVOID unused) {
     rid.hwndTarget = h;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
 
-    if (g_raw_ready_ev) SetEvent(g_raw_ready_ev);
+    if (ready_ev) SetEvent(ready_ev);
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
@@ -781,43 +857,75 @@ static DWORD WINAPI raw_input_thread(LPVOID unused) {
     if (IsWindow(h)) {
         DestroyWindow(h);
     }
-    g_raw_hwnd = NULL;
+
+    AcquireSRWLockExclusive(&g_raw_lock);
+    if (g_raw_hwnd == h) {
+        g_raw_hwnd = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_raw_lock);
     return 0;
 }
 
 void hidpp_plat_start_watchers(void) {
-    if (g_win_watchers_started) return;
+    AcquireSRWLockExclusive(&g_raw_lock);
+    if (g_win_watchers_started) {
+        ReleaseSRWLockExclusive(&g_raw_lock);
+        return;
+    }
     g_win_watchers_started = 1;
+    g_raw_stopping = 0;
     InterlockedExchange64(&g_last_mouse_tick, (LONG64)GetTickCount64());
 
     static DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS power = { win_power_cb, NULL };
     PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, &power, &g_power_notify);
-    g_raw_ready_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
-    g_raw_thread = CreateThread(NULL, 0, raw_input_thread, NULL, 0, NULL);
-    if (g_raw_thread && g_raw_ready_ev) {
-        WaitForSingleObject(g_raw_ready_ev, 500);
+    HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_raw_ready_ev = ev;
+    HANDLE th = CreateThread(NULL, 0, raw_input_thread, ev, 0, NULL);
+    g_raw_thread = th;
+    ReleaseSRWLockExclusive(&g_raw_lock);
+
+    if (th && ev) {
+        WaitForSingleObject(ev, 500);
     }
 }
 
 void hidpp_plat_stop_watchers(void) {
-    if (!g_win_watchers_started) return;
-    g_win_watchers_started = 0;
-    if (g_power_notify) {
-        PowerUnregisterSuspendResumeNotification(g_power_notify);
-        g_power_notify = NULL;
+    AcquireSRWLockExclusive(&g_raw_lock);
+    if (!g_win_watchers_started) {
+        ReleaseSRWLockExclusive(&g_raw_lock);
+        return;
     }
+    g_win_watchers_started = 0;
+    g_raw_stopping = 1;
+    HPOWERNOTIFY pwr = g_power_notify;
+    g_power_notify = NULL;
     HWND h = g_raw_hwnd;
+    HANDLE th = g_raw_thread;
+    g_raw_thread = NULL;
+    HANDLE ev = g_raw_ready_ev;
+    ReleaseSRWLockExclusive(&g_raw_lock);
+
+    if (pwr) {
+        PowerUnregisterSuspendResumeNotification(pwr);
+    }
     if (h) {
         PostMessageW(h, WM_CLOSE, 0, 0);
     }
-    if (g_raw_thread) {
-        WaitForSingleObject(g_raw_thread, 1000);
-        CloseHandle(g_raw_thread);
-        g_raw_thread = NULL;
+    int thread_exited = 1;
+    if (th) {
+        DWORD wr = WaitForSingleObject(th, 2000);
+        if (wr != WAIT_OBJECT_0) {
+            thread_exited = 0;
+        }
+        CloseHandle(th);
     }
-    if (g_raw_ready_ev) {
-        CloseHandle(g_raw_ready_ev);
-        g_raw_ready_ev = NULL;
+    if (thread_exited && ev) {
+        AcquireSRWLockExclusive(&g_raw_lock);
+        if (g_raw_ready_ev == ev) {
+            g_raw_ready_ev = NULL;
+        }
+        ReleaseSRWLockExclusive(&g_raw_lock);
+        CloseHandle(ev);
     }
 }
 

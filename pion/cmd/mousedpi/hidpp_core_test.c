@@ -43,8 +43,19 @@ typedef struct mock_device {
     int                   hidpp2_ff_err;
     int                   fn6_reject_ff;
     int                   fn6_zero_ack;
+    int                   fn6_fake_echo;
+    int32_t               fn6_fake_x;
+    int32_t               fn6_fake_y;
+    int32_t               fn6_fake_lod;
+    int32_t               hw_clamp_x;
+    int32_t               hw_clamp_y;
+    int32_t               hw_clamp_lod;
+    int32_t               last_fn6_x;
+    int32_t               last_fn6_y;
+    int32_t               last_fn6_lod;
     int                   caps_present;
-    uint8_t               caps_flags;      /* bit 0 = indep Y, bit 1 = LOD */
+    uint8_t               caps_num_levels; /* r[5] distractor */
+    uint8_t               caps_flags;      /* r[6]: bit 0 = indep Y, bit 1 = LOD */
     int                   fn5_lod_zero;    /* return r[13] == 0 on fn=5 */
     int                   reject_nonzero_y_lod;
     int                   fn6_writes;
@@ -52,6 +63,8 @@ typedef struct mock_device {
     int                   notif_reg_writes;
     uint8_t               reg00_init[3];   /* initial register 0x00 reply bytes [4..6] */
     int                   reg00_readable;
+    int                   reg00_read_timeout;
+    int                   reg00_write_err;
     uint8_t               reg00_written[3];
     int                   drain_calls;
     int                   notify_disconnect_once;
@@ -296,7 +309,9 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
 
     /* HID++ 1.0 wireless notification register 0x00 read (0x81) */
     if (len == HIDPP_SHORT_LEN && buf[0] == 0x10 && buf[1] == 0xFF && buf[2] == 0x81 && buf[3] == 0x00) {
-        if (m->reg00_readable) {
+        if (m->reg00_read_timeout) {
+            /* Drop reply to simulate timeout */
+        } else if (m->reg00_readable) {
             uint8_t rep[7] = { 0x10, 0xFF, 0x81, 0x00, m->reg00_init[0], m->reg00_init[1], m->reg00_init[2] };
             dev_push_rx(dev, rep, 7);
         } else {
@@ -313,6 +328,13 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         m->reg00_written[0] = buf[4];
         m->reg00_written[1] = buf[5];
         m->reg00_written[2] = buf[6];
+        if (m->reg00_write_err) {
+            uint8_t err[7] = { 0x10, 0xFF, 0x8F, 0x80, 0x00, 0x01, 0x00 };
+            dev_push_rx(dev, err, 7);
+        } else {
+            uint8_t ack[7] = { 0x10, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x00 };
+            dev_push_rx(dev, ack, 7);
+        }
         mock_unlock();
         return (int)len;
     }
@@ -383,10 +405,11 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         else r[4] = 0x00;
         dev_push_rx(dev, r, 20);
     } else if (feat_idx == 0x05 && fn == 1) {
-        /* 0x2202 getSensorCapabilities */
+        /* 0x2202 getSensorCapabilities: r[4]=sensorIdx, r[5]=numDpiLevels, r[6]=capabilities */
         if (m->caps_present) {
             r[4] = 0x00;
-            r[5] = m->caps_flags;
+            r[5] = m->caps_num_levels;
+            r[6] = m->caps_flags;
             dev_push_rx(dev, r, 20);
         } else {
             r[2] = 0xFF;
@@ -409,11 +432,24 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
         int32_t req_x = ((int32_t)buf[5] << 8) | buf[6];
         int32_t req_y = ((int32_t)buf[7] << 8) | buf[8];
         int32_t req_l = buf[9];
+        m->last_fn6_x = req_x;
+        m->last_fn6_y = req_y;
+        m->last_fn6_lod = req_l;
         if (m->fn6_reject_ff || (m->reject_nonzero_y_lod && (req_y != 0 || req_l != 0))) {
             r[2] = 0xFF;
             r[3] = feat_idx;
             r[4] = fn_sw;
             r[5] = 0x02;
+            dev_push_rx(dev, r, 20);
+        } else if (m->fn6_fake_echo) {
+            m->dpi_x = m->hw_clamp_x;
+            m->dpi_y = m->hw_clamp_y;
+            m->lod   = m->hw_clamp_lod;
+            r[5] = (uint8_t)((m->fn6_fake_x >> 8) & 0xFF);
+            r[6] = (uint8_t)(m->fn6_fake_x & 0xFF);
+            r[7] = (uint8_t)((m->fn6_fake_y >> 8) & 0xFF);
+            r[8] = (uint8_t)(m->fn6_fake_y & 0xFF);
+            r[9] = (uint8_t)m->fn6_fake_lod;
             dev_push_rx(dev, r, 20);
         } else {
             m->dpi_x = req_x;
@@ -547,6 +583,7 @@ static void test_strict_frame_matching_and_drain(void) {
     m->dpi_y = 1600;
     m->lod = 3;
     m->battery = 87;
+    m->reg00_readable = 1;
     snprintf(m->dev_name, sizeof(m->dev_name), "G PRO X SUPERLIGHT 2 DEX");
 
     /* Pre-queue a stale bogus frame that MUST be drained before sending */
@@ -1097,7 +1134,8 @@ static void test_fn1_caps_no_indep_y_no_lod_no_rewrite_loop(void) {
     m->lod = 2;
     m->battery = 80;
     m->caps_present = 1;
-    m->caps_flags = 0x00; /* No independent Y, no LOD */
+    m->caps_num_levels = 3; /* Distractor in r[5]: 0b11 != r[6]=0x00 */
+    m->caps_flags = 0x00;   /* r[6]: No independent Y, no LOD */
     m->fn5_lod_zero = 1;
     m->reject_nonzero_y_lod = 1;
 
@@ -1105,6 +1143,7 @@ static void test_fn1_caps_no_indep_y_no_lod_no_rewrite_loop(void) {
     assert(ok == 1);
     assert(mousedpi_get_dpi_x() == 2000);
     assert(m->fn6_writes == 1);
+    assert(m->last_fn6_y == 0 && m->last_fn6_lod == 0);
 
     /* Subsequent fast ensure must NOT rewrite fn=6 */
     hidpp_mutex_lock(&g_hid_lock);
@@ -1371,6 +1410,344 @@ static void test_utf8_device_name_and_device_switch_reset(void) {
     printf("[PASS] test_utf8_device_name_and_device_switch_reset\n");
 }
 
+/* ---- Round 2 regression tests ---- */
+
+static void test_fn1_caps_r6_offset_and_retry_on_failure(void) {
+    /* Case A: (r[5]=3, r[6]=0x00) -> fn=6 must send y=0, lod=0 */
+    mock_reset();
+    g_mock_cfg_has = 1;
+    g_mock_cfg_dpi = 2400;
+    g_mock_cfg_lod = 3;
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/caps_a");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->lod = 2;
+    m->caps_present = 1;
+    m->caps_num_levels = 3; /* 0b11 distractor in r[5] */
+    m->caps_flags = 0x00;   /* r[6] = no indep Y, no LOD */
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(m->fn6_writes == 1);
+    assert(m->last_fn6_x == 2400);
+    assert(m->last_fn6_y == 0);
+    assert(m->last_fn6_lod == 0);
+    mousedpi_stop_waits();
+
+    /* Case B: (r[5]=5, r[6]=0x03) -> fn=6 must send y=dpi, lod!=0 */
+    mock_reset();
+    g_mock_cfg_has = 1;
+    g_mock_cfg_dpi = 3200;
+    g_mock_cfg_lod = 3;
+    g_mock_dev_count = 1;
+    m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/caps_b");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->lod = 1;
+    m->caps_present = 1;
+    m->caps_num_levels = 5; /* 0b101 distractor in r[5] (bit1 == 0) */
+    m->caps_flags = 0x03;   /* r[6] = indep Y + LOD */
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(m->fn6_writes == 1);
+    assert(m->last_fn6_x == 3200);
+    assert(m->last_fn6_y == 3200);
+    assert(m->last_fn6_lod == 3);
+    mousedpi_stop_waits();
+
+    /* Case C: fn=1 failure must NOT permanently set g_cached_caps_read = 1 */
+    mock_reset();
+    g_mock_dev_count = 1;
+    m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/caps_retry");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->lod = 2;
+    m->caps_present = 0; /* First call fails with HID++ 2.0 0xFF error */
+
+    assert(mousedpi_init_and_restore() == 1);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_cached_caps_read == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+
+    /* Now enable fn=1 with (r[5]=3, r[6]=0x00) and trigger a set: must retry fn=1 and honor r[6]=0x00 */
+    mock_lock();
+    m->caps_present = 1;
+    m->caps_num_levels = 3;
+    m->caps_flags = 0x00;
+    mock_unlock();
+
+    int32_t rev0 = mousedpi_state_rev();
+    mousedpi_request_set_seq(1, 1600, 3);
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_cached_caps_read == 1);
+    assert(g_cached_has_indep_y == 0);
+    assert(g_cached_has_lod == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+    assert(m->last_fn6_y == 0 && m->last_fn6_lod == 0);
+    mousedpi_stop_waits();
+    printf("[PASS] test_fn1_caps_r6_offset_and_retry_on_failure\n");
+}
+
+static void test_reg00_read_fail_zero_write_and_write_8f_retry(void) {
+    /* (a1) 0x81 returns 0x8F error -> zero 0x80 writes, g_notif_enabled_gen stays 0 */
+    mock_reset();
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/reg00_err");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1600;
+    m->dpi_y = 1600;
+    m->lod = 2;
+    m->reg00_readable = 0;
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(m->notif_reg_writes == 0);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_notif_enabled_gen == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+    mousedpi_stop_waits();
+
+    /* (a2) 0x81 times out -> zero 0x80 writes, g_notif_enabled_gen stays 0 */
+    mock_reset();
+    g_mock_dev_count = 1;
+    m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/reg00_tmo");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1600;
+    m->dpi_y = 1600;
+    m->lod = 2;
+    m->reg00_read_timeout = 1;
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(m->notif_reg_writes == 0);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_notif_enabled_gen == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+    mousedpi_stop_waits();
+
+    /* (b) 0x81 succeeds, 0x80 returns 0x8F -> g_notif_enabled_gen stays 0, retries on reconnect */
+    mock_reset();
+    g_mock_dev_count = 1;
+    m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/reg00_werr");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1600;
+    m->dpi_y = 1600;
+    m->lod = 2;
+    m->reg00_readable = 1;
+    m->reg00_init[0] = 0x10;
+    m->reg00_init[1] = 0x04;
+    m->reg00_init[2] = 0x20;
+    m->reg00_write_err = 1;
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(m->notif_reg_writes == 1);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_notif_enabled_gen == 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+
+    /* Next reconnect (topology change) with write now succeeding -> must retry and mark enabled */
+    mock_lock();
+    m->reg00_write_err = 0;
+    mock_unlock();
+    int32_t rev0 = mousedpi_state_rev();
+    hidpp_core_signal_topology_change();
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+    hidpp_mutex_lock(&g_hid_lock);
+    assert(g_notif_enabled_gen == g_endpoint_gen && g_notif_enabled_gen != 0);
+    hidpp_mutex_unlock(&g_hid_lock);
+    assert(m->notif_reg_writes == 2);
+    assert(m->reg00_written[0] == 0x10 && m->reg00_written[1] == 0x05 && m->reg00_written[2] == 0x20);
+    mousedpi_stop_waits();
+    printf("[PASS] test_reg00_read_fail_zero_write_and_write_8f_retry\n");
+}
+
+static void test_fn6_always_fn5_readback_ignores_fake_echo(void) {
+    mock_reset();
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/fn6_readback");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->lod = 2;
+    m->battery = 85;
+    m->fn6_fake_echo = 1;
+    m->fn6_fake_x = 2400;
+    m->fn6_fake_y = 2400;
+    m->fn6_fake_lod = 3;
+    m->hw_clamp_x = 2350; /* Sensor actually clamped to 2350 / lod 2 */
+    m->hw_clamp_y = 2350;
+    m->hw_clamp_lod = 2;
+
+    assert(mousedpi_init_and_restore() == 1);
+
+    /* 1. set_dpi_locked must ignore non-zero fake echo and store fn=5 hardware value */
+    int32_t rev0 = mousedpi_state_rev();
+    mousedpi_request_set_seq(5, 2400, 3);
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_applied_seq() == 5);
+    assert(mousedpi_snap_dpi_x() == 2350);
+    assert(mousedpi_snap_lod() == 2);
+    assert(g_mock_cfg_dpi == 2350 && g_mock_cfg_lod == 2);
+
+    /* 2. ensure_dpi_fast_locked must also ignore fake echo and use fn=5 readback */
+    mock_lock();
+    m->dpi_x = 800;
+    m->dpi_y = 800;
+    m->hw_clamp_x = 2300;
+    m->hw_clamp_y = 2300;
+    m->hw_clamp_lod = 1;
+    m->fn6_fake_x = 2350;
+    m->fn6_fake_y = 2350;
+    m->fn6_fake_lod = 2;
+    mock_unlock();
+
+    hidpp_mutex_lock(&g_hid_lock);
+    int changed = 0;
+    assert(ensure_dpi_fast_locked(0, &changed) == 1);
+    assert(changed == 1);
+    assert(g_saved_dpi == 2300 && g_saved_lod == 1);
+    hidpp_mutex_unlock(&g_hid_lock);
+    assert(mousedpi_get_dpi_x() == 2300);
+    assert(mousedpi_get_lod() == 1);
+
+    mousedpi_stop_waits();
+    printf("[PASS] test_fn6_always_fn5_readback_ignores_fake_echo\n");
+}
+
+static void stop_waits_worker(void *unused) {
+    (void)unused;
+    mousedpi_stop_waits();
+}
+
+static void test_concurrent_stop_waits_single_ownership(void) {
+    for (int iter = 0; iter < 10; iter++) {
+        mock_reset();
+        g_mock_needs_notify = 1;
+        g_mock_dev_count = 1;
+        mock_device_t *m = &g_mock_devs[0];
+        snprintf(m->id, sizeof(m->id), "/dev/cstop0");
+        m->vid = 0x046D;
+        m->pid = 0xC54D;
+        m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+        m->has_dpi_feature = 1;
+        m->active_slot = 0x01;
+        m->dpi_x = 1600;
+        m->dpi_y = 1600;
+        m->lod = 2;
+
+        assert(mousedpi_init_and_restore() == 1);
+        mousedpi_request_refresh();
+        mousedpi_request_wake_restore();
+
+        hidpp_thread_t t1, t2;
+        assert(hidpp_thread_start(&t1, stop_waits_worker, NULL) == 1);
+        assert(hidpp_thread_start(&t2, stop_waits_worker, NULL) == 1);
+        mousedpi_stop_waits();
+        hidpp_thread_join(t1);
+        hidpp_thread_join(t2);
+    }
+    printf("[PASS] test_concurrent_stop_waits_single_ownership\n");
+}
+
+static void test_notify_first_open_from_empty_and_no_unrelated_flicker(void) {
+    /* Part 1: Notify thread starts with 0 devices (saw_no_dev=1), then device appears -> triggers topology refresh */
+    mock_reset();
+    g_mock_needs_notify = 1;
+    g_mock_dev_count = 0;
+
+    assert(mousedpi_init_and_restore() == 0);
+    int32_t rev0 = mousedpi_state_rev();
+    /* Let hid_notify_main observe empty device list once */
+    hidpp_plat_sleep_ms(60u);
+
+    mock_lock();
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/first_open0");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1600;
+    m->dpi_y = 1600;
+    m->lod = 2;
+    m->battery = 77;
+    snprintf(m->dev_name, sizeof(m->dev_name), "REAL MOUSE NAME");
+    mock_unlock();
+
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_dpi_x() == 1600);
+    assert(mousedpi_snap_battery() == 77);
+    char *n1 = mousedpi_snap_device_name_dup();
+    assert(n1 != NULL && strcmp(n1, "REAL MOUSE NAME") == 0);
+    free(n1);
+
+    /* Part 2: Unrelated topology change with same (endpoint_id, dev_idx) must NOT flicker battery/name */
+    mock_lock();
+    m->no_battery = 1;
+    m->name_fail = 1;
+    mock_unlock();
+    int32_t rev2 = mousedpi_state_rev();
+    hidpp_core_signal_topology_change();
+    int32_t rev3 = mousedpi_wait_rev(rev2);
+    assert(rev3 > rev2);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_battery() == 77);
+    char *n2 = mousedpi_snap_device_name_dup();
+    assert(n2 != NULL && strcmp(n2, "REAL MOUSE NAME") == 0);
+    free(n2);
+
+    mousedpi_stop_waits();
+    printf("[PASS] test_notify_first_open_from_empty_and_no_unrelated_flicker\n");
+}
+
 int main(void) {
     test_pid_classification();
     test_strict_frame_matching_and_drain();
@@ -1390,6 +1767,11 @@ int main(void) {
     test_rapid_start_stop_lifecycle_stress();
     test_pid_c5xx_wildcard_ble_slot0_and_reg00_rmw();
     test_utf8_device_name_and_device_switch_reset();
+    test_fn1_caps_r6_offset_and_retry_on_failure();
+    test_reg00_read_fail_zero_write_and_write_8f_retry();
+    test_fn6_always_fn5_readback_ignores_fake_echo();
+    test_concurrent_stop_waits_single_ownership();
+    test_notify_first_open_from_empty_and_no_unrelated_flicker();
     printf("ALL HID++ CORE TESTS PASSED!\n");
     return 0;
 }

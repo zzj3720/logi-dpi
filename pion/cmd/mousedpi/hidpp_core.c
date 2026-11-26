@@ -394,6 +394,9 @@ typedef struct hidpp_state {
 } hidpp_state_t;
 
 static hidpp_mutex_t  g_life_lock;
+static hidpp_cond_t   g_stop_cv;
+static int            g_stop_claimed = 0;
+static int            g_stop_done = 0;
 static hidpp_mutex_t  g_hid_lock;
 static hidpp_mutex_t  g_snap_lock;
 static hidpp_cond_t   g_rev_cv;
@@ -445,6 +448,9 @@ static int                   g_cached_caps_read = 0;
 static int                   g_cached_has_indep_y = 1;
 static int                   g_cached_has_lod = 1;
 static uint64_t              g_notif_enabled_gen = 0;
+static char                  g_last_connected_ep_id[HIDPP_ENDPOINT_ID_MAX];
+static uint8_t               g_last_connected_dev_idx = 0;
+static int                   g_device_switched = 0;
 
 static void init_default_state(hidpp_state_t *s) {
     memset(s, 0, sizeof(*s));
@@ -462,6 +468,9 @@ static void init_default_state(hidpp_state_t *s) {
 
 static void core_init_primitives(void) {
     hidpp_mutex_init(&g_life_lock);
+    hidpp_cond_init(&g_stop_cv);
+    g_stop_claimed = 0;
+    g_stop_done = 0;
     hidpp_mutex_init(&g_hid_lock);
     hidpp_mutex_init(&g_snap_lock);
     hidpp_cond_init(&g_rev_cv);
@@ -674,54 +683,88 @@ static uint8_t get_feature_idx(hidpp_dev_t *dev, uint8_t dev_idx, uint16_t fid) 
     return r[4];
 }
 
-/* Best-effort HID++ 1.0 register 0x00 read-modify-write to enable wireless notifications
- * without clobbering existing receiver notification flags. */
+/* Strict HID++ 1.0 register 0x00 read-modify-write to enable wireless notifications
+ * without clobbering existing receiver notification flags.
+ * Aborts with zero writes if 0x81 read fails/times out; requires 0x80 0x00 ACK to return 1. */
 static int try_enable_wireless_notif(hidpp_dev_t *dev) {
-    uint8_t b4 = 0x00u;
-    uint8_t b5 = 0x01u;
-    uint8_t b6 = 0x00u;
+    uint8_t reg[3] = { 0x00u, 0x00u, 0x00u };
+    int read_ok = 0;
 
     uint8_t rreq[HIDPP_SHORT_LEN] = {
         HIDPP_SHORT_REPORT_ID, 0xFFu, 0x81u, 0x00u, 0x00u, 0x00u, 0x00u
     };
     hidpp_plat_drain(dev);
-    if (hidpp_plat_write(dev, rreq, sizeof(rreq)) >= HIDPP_SHORT_LEN) {
-        uint64_t deadline = hidpp_plat_now_ms() + 150u;
-        for (;;) {
-            uint64_t now = hidpp_plat_now_ms();
-            if (now >= deadline) break;
-            uint64_t rem64 = deadline - now;
-            int rem = rem64 > 150u ? 150 : (int)rem64;
-            if (rem <= 0) rem = 1;
-            uint8_t r[64];
-            memset(r, 0, sizeof(r));
-            int got = hidpp_plat_read(dev, r, sizeof(r), rem);
-            if (got <= 0) break;
-            if (got >= HIDPP_SHORT_LEN &&
-                r[0] == HIDPP_SHORT_REPORT_ID &&
-                r[1] == 0xFFu &&
-                r[2] == 0x81u &&
-                r[3] == 0x00u) {
-                b4 = r[4];
-                b5 = (uint8_t)(r[5] | 0x01u);
-                b6 = r[6];
-                break;
-            }
-            if (got >= HIDPP_SHORT_LEN &&
-                r[0] == HIDPP_SHORT_REPORT_ID &&
-                r[1] == 0xFFu &&
-                r[2] == 0x8Fu &&
-                r[3] == 0x81u &&
-                r[4] == 0x00u) {
-                break;
-            }
-        }
+    if (hidpp_plat_write(dev, rreq, sizeof(rreq)) < HIDPP_SHORT_LEN) {
+        return 0;
     }
 
+    uint64_t rdeadline = hidpp_plat_now_ms() + 150u;
+    for (;;) {
+        uint64_t now = hidpp_plat_now_ms();
+        if (now >= rdeadline) return 0;
+        uint64_t rem64 = rdeadline - now;
+        int rem = rem64 > 150u ? 150 : (int)rem64;
+        if (rem <= 0) rem = 1;
+        uint8_t r[64];
+        memset(r, 0, sizeof(r));
+        int got = hidpp_plat_read(dev, r, sizeof(r), rem);
+        if (got <= 0) return 0;
+        if (got >= HIDPP_SHORT_LEN &&
+            r[0] == HIDPP_SHORT_REPORT_ID &&
+            r[1] == 0xFFu &&
+            r[2] == 0x81u &&
+            r[3] == 0x00u) {
+            reg[0] = r[4];
+            reg[1] = (uint8_t)(r[5] | 0x01u);
+            reg[2] = r[6];
+            read_ok = 1;
+            break;
+        }
+        if (got >= HIDPP_SHORT_LEN &&
+            r[0] == HIDPP_SHORT_REPORT_ID &&
+            r[1] == 0xFFu &&
+            r[2] == 0x8Fu &&
+            r[3] == 0x81u &&
+            r[4] == 0x00u) {
+            return 0;
+        }
+    }
+    if (!read_ok) return 0;
+
     uint8_t wreq[HIDPP_SHORT_LEN] = {
-        HIDPP_SHORT_REPORT_ID, 0xFFu, 0x80u, 0x00u, b4, b5, b6
+        HIDPP_SHORT_REPORT_ID, 0xFFu, 0x80u, 0x00u, reg[0], reg[1], reg[2]
     };
-    return (hidpp_plat_write(dev, wreq, sizeof(wreq)) >= HIDPP_SHORT_LEN) ? 1 : 0;
+    if (hidpp_plat_write(dev, wreq, sizeof(wreq)) < HIDPP_SHORT_LEN) {
+        return 0;
+    }
+
+    uint64_t wdeadline = hidpp_plat_now_ms() + 150u;
+    for (;;) {
+        uint64_t now = hidpp_plat_now_ms();
+        if (now >= wdeadline) return 0;
+        uint64_t rem64 = wdeadline - now;
+        int rem = rem64 > 150u ? 150 : (int)rem64;
+        if (rem <= 0) rem = 1;
+        uint8_t r[64];
+        memset(r, 0, sizeof(r));
+        int got = hidpp_plat_read(dev, r, sizeof(r), rem);
+        if (got <= 0) return 0;
+        if (got >= HIDPP_SHORT_LEN &&
+            r[0] == HIDPP_SHORT_REPORT_ID &&
+            r[1] == 0xFFu &&
+            r[2] == 0x80u &&
+            r[3] == 0x00u) {
+            return 1;
+        }
+        if (got >= HIDPP_SHORT_LEN &&
+            r[0] == HIDPP_SHORT_REPORT_ID &&
+            r[1] == 0xFFu &&
+            r[2] == 0x8Fu &&
+            r[3] == 0x80u &&
+            r[4] == 0x00u) {
+            return 0;
+        }
+    }
 }
 
 /* Dynamic device name via HID++ 2.0 feature 0x0005 (preserves valid UTF-8, filters control chars). */
@@ -816,6 +859,15 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
                 invalidate_feature_cache_locked();
                 g_cached_idx_dpi = idx_dpi;
 
+                if (g_last_connected_ep_id[0] == '\0' ||
+                    strcmp(g_last_connected_ep_id, eps[i].id) != 0 ||
+                    g_last_connected_dev_idx != slots[s]) {
+                    g_device_switched = 1;
+                    memcpy(g_last_connected_ep_id, eps[i].id, sizeof(g_last_connected_ep_id));
+                    g_last_connected_ep_id[sizeof(g_last_connected_ep_id) - 1] = '\0';
+                    g_last_connected_dev_idx = slots[s];
+                }
+
                 if ((eps[i].kind == HIDPP_KIND_LIGHTSPEED_RECEIVER ||
                      eps[i].kind == HIDPP_KIND_MULTI_RECEIVER) &&
                     g_notif_enabled_gen != g_endpoint_gen) {
@@ -836,17 +888,18 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
 
 static void ensure_dpi_caps_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_dpi) {
     if (g_cached_caps_read) return;
-    g_cached_caps_read = 1;
-    g_cached_has_indep_y = 1;
-    g_cached_has_lod = 1;
 
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
     uint8_t p0[1] = { 0x00u };
-    if (hidpp_xfer(dev, dev_idx, idx_dpi, 1, p0, 1, r, &got) == HIDPP_XFER_OK && got >= 6) {
-        uint8_t flags = r[5];
+    /* 0x2202 fn=1 getSensorCapabilities response:
+     * [0x11, dev_idx, feat_idx, fn_sw, sensorIdx(r[4]), numDpiLevels(r[5]), capabilities(r[6]), ...] */
+    if (hidpp_xfer(dev, dev_idx, idx_dpi, 1, p0, 1, r, &got) == HIDPP_XFER_OK &&
+        got >= 7 && r[4] == 0x00u) {
+        uint8_t flags = r[6];
         g_cached_has_indep_y = (flags & 0x01u) ? 1 : 0;
         g_cached_has_lod     = (flags & 0x02u) ? 1 : 0;
+        g_cached_caps_read   = 1;
     }
 }
 
@@ -927,7 +980,7 @@ static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
             return 0;
         }
 
-        if (g_last_read_gen != g_endpoint_gen) {
+        if (g_device_switched) {
             st.battery = -1;
             st.mode = -1;
             st.device_name[0] = '\0';
@@ -962,6 +1015,7 @@ static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
         if (st.device_name[0] == '\0') {
             snprintf(st.device_name, sizeof(st.device_name), "%s", HIDPP_DEFAULT_DEVICE_NAME);
         }
+        g_device_switched = 0;
         g_last_read_gen = g_endpoint_gen;
 
         hidpp_plat_close(dev);
@@ -1052,27 +1106,19 @@ static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg,
             return -3;
         }
 
-        int32_t echo_x = (got >= 10) ? (((int32_t)r[5] << 8) | r[6]) : 0;
-        if (echo_x >= HIDPP_MIN_DPI && echo_x <= HIDPP_MAX_DPI) {
-            st.dpi_x = echo_x;
-            int32_t echo_y = ((int32_t)r[7] << 8) | r[8];
-            st.dpi_y = (echo_y >= HIDPP_MIN_DPI && echo_y <= HIDPP_MAX_DPI) ? echo_y : echo_x;
-            if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
-        } else {
-            /* Zero-filled or short ACK: read back real DPI/LOD via fn=5; never store 0. */
-            int32_t rx = 0, ry = 0, rlod = st.lod;
-            if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
-                hidpp_plat_close(dev);
-                invalidate_cache_locked();
-                if (was_cached) continue;
-                st.connected = 0;
-                commit_state_seq(&st, bump_rev, min_applied_seq);
-                return -3;
-            }
-            st.dpi_x = rx;
-            st.dpi_y = ry;
-            st.lod = rlod;
+        /* Always confirm actual applied DPI/LOD from sensor via fn=5 readback. */
+        int32_t rx = 0, ry = 0, rlod = st.lod;
+        if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
+            hidpp_plat_close(dev);
+            invalidate_cache_locked();
+            if (was_cached) continue;
+            st.connected = 0;
+            commit_state_seq(&st, bump_rev, min_applied_seq);
+            return -3;
         }
+        st.dpi_x = rx;
+        st.dpi_y = ry;
+        st.lod = rlod;
         hidpp_plat_close(dev);
 
         st.connected = 1;
@@ -1121,13 +1167,6 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
 
     ensure_dpi_caps_locked(dev, dev_idx, idx_dpi);
 
-    int new_device = (g_last_read_gen != g_endpoint_gen) ? 1 : 0;
-    if (new_device) {
-        st.battery = -1;
-        st.mode = -1;
-        snprintf(st.device_name, sizeof(st.device_name), "%s", HIDPP_DEFAULT_DEVICE_NAME);
-    }
-
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
     int need_write = force_write;
@@ -1135,7 +1174,7 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
     if (!need_write) {
         int32_t cx = 0, cy = 0, clod = st.lod;
         if (read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &cx, &cy, &clod, st.lod)) {
-            int diff = (new_device || st.connected == 0 || st.dpi_x != cx || st.dpi_y != cy || st.lod != clod);
+            int diff = (st.connected == 0 || st.dpi_x != cx || st.dpi_y != cy || st.lod != clod);
             st.dpi_x = cx;
             st.dpi_y = cy;
             st.lod = clod;
@@ -1145,7 +1184,7 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
             int lod_mismatch = g_cached_has_lod && (clod != g_saved_lod);
             if (cx != g_saved_dpi || y_mismatch || lod_mismatch) {
                 need_write = 1;
-            } else if (diff) {
+            } else if (diff && !g_device_switched) {
                 commit_state(&st, 1);
                 if (out_changed) *out_changed = 1;
             }
@@ -1179,30 +1218,25 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
             (uint8_t)lod_send
         };
         if (hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got) == HIDPP_XFER_OK) {
-            int32_t echo_x = (got >= 10) ? (((int32_t)r[5] << 8) | r[6]) : 0;
-            if (echo_x >= HIDPP_MIN_DPI && echo_x <= HIDPP_MAX_DPI) {
-                st.dpi_x = echo_x;
-                int32_t echo_y = ((int32_t)r[7] << 8) | r[8];
-                st.dpi_y = (echo_y >= HIDPP_MIN_DPI && echo_y <= HIDPP_MAX_DPI) ? echo_y : echo_x;
-                if (r[9] >= 1 && r[9] <= 3) st.lod = r[9];
-            } else {
-                int32_t rx = 0, ry = 0, rlod = st.lod;
-                if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
-                    hidpp_plat_close(dev);
-                    invalidate_cache_locked();
-                    return 0;
-                }
-                st.dpi_x = rx;
-                st.dpi_y = ry;
-                st.lod = rlod;
+            /* Always confirm actual applied DPI/LOD from sensor via fn=5 readback. */
+            int32_t rx = 0, ry = 0, rlod = st.lod;
+            if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
+                hidpp_plat_close(dev);
+                invalidate_cache_locked();
+                return 0;
             }
+            st.dpi_x = rx;
+            st.dpi_y = ry;
+            st.lod = rlod;
             st.connected = 1;
             st.perm_denied = 0;
             /* Sync saved targets with device-confirmed values to prevent repeated 2s writebacks. */
             g_saved_dpi = st.dpi_x;
             g_saved_lod = st.lod;
-            commit_state(&st, 1);
-            if (out_changed) *out_changed = 1;
+            if (!g_device_switched) {
+                commit_state(&st, 1);
+                if (out_changed) *out_changed = 1;
+            }
         } else {
             hidpp_plat_close(dev);
             invalidate_cache_locked();
@@ -1246,6 +1280,11 @@ static void hidpp_core_signal_feat_dirty(void) {
     hidpp_mutex_lock(&g_snap_lock);
     g_feat_cache_dirty = 1;
     hidpp_mutex_unlock(&g_snap_lock);
+}
+
+void hidpp_core_signal_wake_reconnect(void) {
+    hidpp_core_signal_feat_dirty();
+    hidpp_core_signal_wake();
 }
 
 static void wake_watcher_main(void *unused) {
@@ -1299,6 +1338,10 @@ static void wake_watcher_main(void *unused) {
             hidpp_mutex_lock(&g_hid_lock);
             consume_dirty_flags_locked();
             restored = ensure_dpi_fast_locked(0, &changed);
+            if (restored && g_device_switched) {
+                (void)read_state_locked(1, 0);
+                changed = 1;
+            }
             hidpp_mutex_unlock(&g_hid_lock);
             if (restored) {
                 /* Bump rev only without overwriting concurrent live state fields. */
@@ -1351,7 +1394,8 @@ static void refresher_main(void *unused) {
 
 static void hid_notify_main(void *unused) {
     (void)unused;
-    int ever_opened = 0;
+    int saw_no_dev = 0;
+    int had_disconnect = 0;
     char last_ep_id[HIDPP_ENDPOINT_ID_MAX];
     last_ep_id[0] = '\0';
 
@@ -1377,14 +1421,17 @@ static void hid_notify_main(void *unused) {
             if (dev) opened_id = eps[0].id;
         }
         if (!dev) {
+            saw_no_dev = 1;
             hidpp_plat_sleep_ms(1000u);
             continue;
         }
 
-        if (ever_opened || (opened_id && last_ep_id[0] != '\0' && strcmp(last_ep_id, opened_id) != 0)) {
+        if (saw_no_dev || had_disconnect ||
+            (opened_id && last_ep_id[0] != '\0' && strcmp(last_ep_id, opened_id) != 0)) {
             hidpp_core_signal_topology_change();
         }
-        ever_opened = 1;
+        saw_no_dev = 0;
+        had_disconnect = 0;
         if (opened_id) {
             size_t n = strlen(opened_id);
             if (n >= sizeof(last_ep_id)) n = sizeof(last_ep_id) - 1;
@@ -1397,6 +1444,7 @@ static void hid_notify_main(void *unused) {
             memset(buf, 0, sizeof(buf));
             int got = hidpp_plat_read(dev, buf, sizeof(buf), 500);
             if (got < 0) {
+                had_disconnect = 1;
                 hidpp_core_signal_topology_change();
                 break;
             }
@@ -1405,8 +1453,7 @@ static void hid_notify_main(void *unused) {
                 (buf[0] == HIDPP_SHORT_REPORT_ID || buf[0] == HIDPP_LONG_REPORT_ID) &&
                 buf[2] == 0x41u &&
                 ((buf[4] & 0x40u) == 0u)) {
-                hidpp_core_signal_feat_dirty();
-                hidpp_core_signal_wake();
+                hidpp_core_signal_wake_reconnect();
             }
         }
 
@@ -1565,6 +1612,15 @@ int32_t mousedpi_wait_rev(int32_t seen) {
 void mousedpi_stop_waits(void) {
     ensure_core_mutexes();
     hidpp_mutex_lock(&g_life_lock);
+    if (g_stop_claimed) {
+        while (!g_stop_done) {
+            hidpp_cond_wait(&g_stop_cv, &g_life_lock);
+        }
+        hidpp_mutex_unlock(&g_life_lock);
+        return;
+    }
+    g_stop_claimed = 1;
+    g_stop_done = 0;
 
     hidpp_mutex_lock(&g_snap_lock);
     g_stopping = 1;
@@ -1599,6 +1655,11 @@ void mousedpi_stop_waits(void) {
     if (join_wake) hidpp_thread_join(th_wake);
     if (join_refresh) hidpp_thread_join(th_refresh);
     if (join_notify) hidpp_thread_join(th_notify);
+
+    hidpp_mutex_lock(&g_life_lock);
+    g_stop_done = 1;
+    hidpp_cond_broadcast(&g_stop_cv);
+    hidpp_mutex_unlock(&g_life_lock);
 }
 
 int32_t mousedpi_get_connected(void) {
@@ -1732,6 +1793,9 @@ static void hidpp_core_test_reset(void) {
     invalidate_cache_locked();
     g_last_read_gen = 0;
     g_notif_enabled_gen = 0;
+    g_last_connected_ep_id[0] = '\0';
+    g_last_connected_dev_idx = 0;
+    g_device_switched = 0;
     g_has_saved = 0;
     g_saved_dpi = HIDPP_DEFAULT_DPI;
     g_saved_lod = HIDPP_DEFAULT_LOD;
@@ -1756,6 +1820,8 @@ static void hidpp_core_test_reset(void) {
     hidpp_mutex_unlock(&g_refresh_lock);
 
     g_watchers_started = 0;
+    g_stop_claimed = 0;
+    g_stop_done = 0;
     hidpp_mutex_unlock(&g_life_lock);
 }
 #endif

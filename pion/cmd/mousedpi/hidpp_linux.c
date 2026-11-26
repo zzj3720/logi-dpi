@@ -82,10 +82,16 @@ static void *linux_inotify_thread_main(void *unused) {
     int in_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (in_fd < 0) return NULL;
 
-    int wd = inotify_add_watch(in_fd, "/dev", IN_CREATE | IN_DELETE);
+    int wd = inotify_add_watch(in_fd, "/dev", IN_CREATE | IN_DELETE | IN_ATTRIB);
     if (wd < 0) {
         close(in_fd);
         return NULL;
+    }
+
+    /* Trigger a catch-up scan after the watch is active if nothing is connected yet
+     * (covers udev ACLs that completed before inotify_add_watch ran). */
+    if (!hidpp_core_is_stopping() && mousedpi_get_connected() == 0) {
+        hidpp_core_signal_topology_change();
     }
 
     int wake_fd = -1;
@@ -469,7 +475,16 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
         }
 
         if (found && dbus_sni_host_registered(&g, conn)) {
-            ready = 1;
+            uint64_t settle_end = hidpp_plat_now_ms() + 100u;
+            while (!hidpp_core_is_stopping()) {
+                uint64_t now = hidpp_plat_now_ms();
+                if (now >= settle_end) break;
+                uint64_t rem = settle_end - now;
+                hidpp_plat_sleep_ms(rem > 20u ? 20u : (uint32_t)rem);
+            }
+            if (!hidpp_core_is_stopping() && dbus_sni_host_registered(&g, conn)) {
+                ready = 1;
+            }
             break;
         }
 
@@ -621,6 +636,28 @@ static int probe_hidraw_rdesc(const char *hidraw_name, const char *dev_path, int
     return match;
 }
 
+static void format_endpoint_id(char *out, size_t cap, const char *dev_path,
+                               uint16_t vid, uint16_t pid,
+                               const char *phys, const char *uniq) {
+    if (!out || cap == 0) return;
+    char tmp[1024];
+    int n = snprintf(tmp, sizeof(tmp), "%s|%04x:%04x|%s|%s",
+                     dev_path ? dev_path : "",
+                     (unsigned)vid,
+                     (unsigned)pid,
+                     phys ? phys : "",
+                     uniq ? uniq : "");
+    if (n <= 0) {
+        out[0] = '\0';
+        return;
+    }
+    size_t len = (size_t)n;
+    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+    if (len >= cap) len = cap - 1;
+    memcpy(out, tmp, len);
+    out[len] = '\0';
+}
+
 static int cmp_linux_cand(const void *a, const void *b) {
     const linux_cand_t *ca = (const linux_cand_t *)a;
     const linux_cand_t *cb = (const linux_cand_t *)b;
@@ -682,8 +719,8 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
 
         if (dup_idx >= 0) {
             if (cands[dup_idx].is_dj_child && !is_dj_child) {
-                memcpy(cands[dup_idx].info.id, dev_path, sizeof(cands[dup_idx].info.id));
-                cands[dup_idx].info.id[sizeof(cands[dup_idx].info.id) - 1] = '\0';
+                format_endpoint_id(cands[dup_idx].info.id, sizeof(cands[dup_idx].info.id),
+                                   dev_path, vid, pid, phys, uniq);
                 cands[dup_idx].info.vid = vid;
                 cands[dup_idx].info.pid = pid;
                 cands[dup_idx].info.kind = hidpp_classify_pid(pid);
@@ -697,8 +734,8 @@ int hidpp_plat_enumerate(hidpp_endpoint_info_t *out, int max_count, int *out_per
         if (ncand < HIDPP_MAX_ENDPOINTS) {
             linux_cand_t *c = &cands[ncand++];
             memset(c, 0, sizeof(*c));
-            memcpy(c->info.id, dev_path, sizeof(c->info.id));
-            c->info.id[sizeof(c->info.id) - 1] = '\0';
+            format_endpoint_id(c->info.id, sizeof(c->info.id),
+                               dev_path, vid, pid, phys, uniq);
             c->info.vid = vid;
             c->info.pid = pid;
             c->info.kind = hidpp_classify_pid(pid);
@@ -728,8 +765,35 @@ hidpp_dev_t *hidpp_plat_open(const char *endpoint_id, int notify_only, int *out_
     if (out_perm_denied) *out_perm_denied = 0;
     if (!endpoint_id || !endpoint_id[0]) return NULL;
 
+    char dev_path[HIDPP_ENDPOINT_ID_MAX];
+    const char *bar = strchr(endpoint_id, '|');
+    if (bar) {
+        size_t plen = (size_t)(bar - endpoint_id);
+        if (plen == 0 || plen >= sizeof(dev_path)) return NULL;
+        memcpy(dev_path, endpoint_id, plen);
+        dev_path[plen] = '\0';
+
+        if (strncmp(dev_path, "/dev/", 5) != 0 || dev_path[5] == '\0') {
+            return NULL;
+        }
+        const char *hidraw_name = dev_path + 5;
+        uint16_t vid = 0, pid = 0;
+        char phys[256];
+        char uniq[128];
+        if (!parse_uevent(hidraw_name, &vid, &pid, phys, sizeof(phys), uniq, sizeof(uniq))) {
+            return NULL;
+        }
+        char actual_id[HIDPP_ENDPOINT_ID_MAX];
+        format_endpoint_id(actual_id, sizeof(actual_id), dev_path, vid, pid, phys, uniq);
+        if (strcmp(actual_id, endpoint_id) != 0) {
+            return NULL;
+        }
+    } else {
+        snprintf(dev_path, sizeof(dev_path), "%s", endpoint_id);
+    }
+
     int flags = (notify_only ? O_RDONLY : O_RDWR) | O_NONBLOCK | O_CLOEXEC;
-    int fd = open(endpoint_id, flags);
+    int fd = open(dev_path, flags);
     if (fd < 0) {
         if ((errno == EACCES || errno == EPERM) && out_perm_denied) {
             *out_perm_denied = 1;
@@ -859,14 +923,21 @@ static int escape_desktop_exec_arg(const char *src, char *dst, size_t cap) {
     size_t pos = 0;
     for (const char *p = src; *p; p++) {
         char c = *p;
-        if (c == '%') {
-            if (pos + 2 >= cap) return 0;
-            dst[pos++] = '%';
-            dst[pos++] = '%';
-        } else if (c == '\\' || c == '"' || c == '`' || c == '$') {
-            if (pos + 2 >= cap) return 0;
+        if (c == '\\') {
+            if (pos + 4 >= cap) return 0;
+            dst[pos++] = '\\';
+            dst[pos++] = '\\';
+            dst[pos++] = '\\';
+            dst[pos++] = '\\';
+        } else if (c == '"' || c == '`' || c == '$') {
+            if (pos + 3 >= cap) return 0;
+            dst[pos++] = '\\';
             dst[pos++] = '\\';
             dst[pos++] = c;
+        } else if (c == '%') {
+            if (pos + 2 >= cap) return 0;
+            dst[pos++] = '%';
+            dst[pos++] = '%';
         } else {
             if (pos + 1 >= cap) return 0;
             dst[pos++] = c;
@@ -895,7 +966,7 @@ int32_t hidpp_plat_set_autostart(int32_t enable) {
         (void)mkdir_p_dir(dir);
     }
 
-    char escaped_exe[PATH_MAX * 2];
+    char escaped_exe[PATH_MAX * 4 + 1];
     if (!escape_desktop_exec_arg(g_exe_path, escaped_exe, sizeof(escaped_exe))) {
         return hidpp_plat_get_autostart();
     }
