@@ -52,19 +52,21 @@ fn ink_tertiary() -> Int64 {
 }
 
 /// The worker's events into `m` (bound before every frame; `pending_seq[0]` and `pending_token[0]` track the in-flight
-/// optimistic write for one target device, and `active_token[0]` is the atomic device target token of the latest snapshot).
+/// optimistic write for one target device, and `active_token` is the reactive device target token of the latest snapshot).
 fn take(
   m : Mouse,
   pending_seq : Array[Int],
   pending_token : Array[Int],
-  active_token : Array[Int],
+  active_token : signals::Signal[Int],
   ev : Ev,
 ) -> Unit {
   match ev {
     Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq, target_token) => {
-      let target_changed = target_token != active_token[0]
+      let target_changed = target_token != active_token.untracked()
       let had_pending = pending_seq[0] > 0
-      active_token[0] = target_token
+      if target_changed {
+        active_token.set(target_token)
+      }
       if target_changed || (had_pending && pending_token[0] != target_token) {
         // Target switched: drop any unconfirmed optimistic state from the previous device immediately
         // so its DPI/LOD can never be combined with the new device's target_token.
@@ -178,8 +180,56 @@ fn Hairline(parent : view::View) -> Unit {
   <ui::Box in={parent} height={0.5} bg_by=>{lg::surface().separator} rigid />
 }
 
+/// Keyed DPI slider: rebuilding by `active_token` immediately tears down the previous slider node and cancels
+/// any in-flight pointer capture whenever the target mouse switches mid-drag.
+fn DpiSlider(
+  parent : view::View,
+  m~ : Mouse,
+  active_token~ : signals::Signal[Int],
+  ask_for~ : (Int, Int, Int) -> Unit,
+) -> Unit {
+  let slider_host = ui::Col(parent, rigid=true)
+  slider_host.each(
+    fn() { [active_token.get()] },
+    fn(tok : Int) { tok },
+    fn(slot : view::View, tok_sig : signals::Signal[Int]) -> Unit {
+      let tok = tok_sig.untracked()
+      <lg::Slider
+        in={slot}
+        value_by=>{
+          let v = m.dpi.get()
+          let clamped = if v < dpi_least { dpi_least } else if v > dpi_most { dpi_most } else { v }
+          clamped.to_double()
+        }
+        on_change={fn(v : Double) -> Unit {
+          if tok == active_token.untracked() {
+            m.dpi.set(v.to_int())
+          }
+        }}
+        on_commit={fn(v : Double) -> Unit {
+          if tok == active_token.untracked() {
+            ask_for(tok, v.to_int(), m.lod.untracked())
+          }
+        }}
+        label="DPI"
+        min={dpi_least.to_double()}
+        max={dpi_most.to_double()}
+        step={dpi_step.to_double()}
+      />
+    },
+    at_once=true,
+  )
+}
+
 /// The right: the DPI read out large with its stepper and slider on the page, then the settings as rows between hairlines.
-fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ : (Int, Int) -> Unit) -> Unit {
+fn DpiSide(
+  parent : view::View,
+  m~ : Mouse,
+  worker~ : ui::Worker[Cmd, Ev],
+  active_token~ : signals::Signal[Int],
+  ask~ : (Int, Int) -> Unit,
+  ask_for~ : (Int, Int, Int) -> Unit,
+) -> Unit {
   let set_dpi = fn(v : Int) -> Unit {
     if v != m.dpi.untracked() {
       ask(v, m.lod.untracked())
@@ -207,21 +257,10 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
       </ui::Box>
     </ui::Row>
     // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`on_change`),
-    // the mouse is written once the hand lets go (`on_commit`).
+    // the mouse is written once the hand lets go (`on_commit`). Keying the slider by `active_token` immediately
+    // disposes the old slider and cancels any in-flight pointer capture if the target mouse switches mid-drag.
     <ui::Col gap={6.0} pad_x={4.0} rigid>
-      <lg::Slider
-        value_by=>{
-          let v = m.dpi.get()
-          let clamped = if v < dpi_least { dpi_least } else if v > dpi_most { dpi_most } else { v }
-          clamped.to_double()
-        }
-        on_change={fn(v : Double) -> Unit { m.dpi.set(v.to_int()) }}
-        on_commit={fn(v : Double) -> Unit { ask(v.to_int(), m.lod.untracked()) }}
-        label="DPI"
-        min={dpi_least.to_double()}
-        max={dpi_most.to_double()}
-        step={dpi_step.to_double()}
-      />
+      <DpiSlider m={m} active_token={active_token} ask_for={ask_for} />
       <ui::Row along={.Between} rigid>
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="200" />
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="1000" />
@@ -292,7 +331,7 @@ pub fn app(
   let next_seq : Array[Int] = [0]
   let pending_seq : Array[Int] = [0]
   let pending_token : Array[Int] = [0]
-  let active_token : Array[Int] = [0]
+  let active_token : signals::Signal[Int] = signals::signal(0)
   worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, pending_token, active_token, ev) })
   // reads the device side does on its own (a thread that waits on them), taken as the worker's are
   match reads {
@@ -305,14 +344,20 @@ pub fn app(
   }
   // shown at once; written by the worker with a monotonic sequence number and the UI-seen device target token
   // so stale reads are ignored, target switches cancel previous optimistic state, and real readbacks apply immediately.
-  let ask = fn(dpi : Int, lod : Int) -> Unit {
+  let ask_for = fn(expected_tok : Int, dpi : Int, lod : Int) -> Unit {
+    if expected_tok != active_token.untracked() {
+      return
+    }
     let seq = next_seq[0] + 1
     next_seq[0] = seq
     pending_seq[0] = seq
-    pending_token[0] = active_token[0]
+    pending_token[0] = expected_tok
     m.dpi.set(dpi)
     m.lod.set(lod)
-    let _ = worker.send(Cmd::Set(seq, active_token[0], dpi, lod))
+    let _ = worker.send(Cmd::Set(seq, expected_tok, dpi, lod))
+  }
+  let ask = fn(dpi : Int, lod : Int) -> Unit {
+    ask_for(active_token.untracked(), dpi, lod)
   }
   <lg::PageShell
     in={root}
@@ -339,7 +384,7 @@ pub fn app(
   >
     <ui::Row pad_x={16.0} gap={12.0} align={.Start}>
       <MouseSide m={m} picture={picture} perm_hint={perm_hint} />
-      <DpiSide m={m} worker={worker} ask={ask} />
+      <DpiSide m={m} worker={worker} active_token={active_token} ask={ask} ask_for={ask_for} />
     </ui::Row>
   </lg::PageShell>
 }

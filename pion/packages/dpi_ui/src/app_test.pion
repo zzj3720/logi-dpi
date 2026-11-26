@@ -492,3 +492,77 @@ test "target switch cancels pending optimistic state from previous mouse before 
   t.dispose()
   lg::set_dark(None)
 }
+
+test "mid-drag slider across device switch cancels A gesture and never writes A's DPI to B" {
+  lg::set_dark(Some(true))
+  let m = Mouse::new()
+  m.connected.set(true)
+  m.dpi.set(800)
+  m.lod.set(2)
+  let sets : Array[(Int, Int, Int, Int)] = []
+  let worker = ui::Worker::inline(fn(cmd : Cmd, _emit : (Ev) -> Unit) -> Unit {
+    match cmd {
+      Cmd::Set(seq, tok, d, l) => sets.push((seq, tok, d, l))
+      _ => ()
+    }
+  })
+  let reads : ui::EventQueue[Ev] = ui::EventQueue::new()
+  let t = window(m, worker, [], reads=reads)
+  t.frame()
+
+  // Seed Mouse A (token=7, 800 DPI, LOD 2).
+  reads.emit(Ev::Read(true, 800, 2, 80, false, "Mouse A", 0, 7))
+  t.frame(ms=16.0)
+
+  let slider = match t.get("DPI", role=view::Role::Slider) {
+    Some(d) => d
+    None => {
+      debug_assert(false, "DPI slider should be present")
+      abort("missing slider")
+    }
+  }
+  let cy = slider.y + slider.h / 2.0
+  let x_start = slider.x + slider.w * 0.16
+  let x_drag = slider.x + slider.w * 0.75
+  let x_after = slider.x + slider.w * 0.85
+
+  // Begin dragging the DPI slider on Mouse A without releasing.
+  t.press_at(x_start, cy)
+  t.move_to(x_drag, cy)
+  debug_assert(sets.length() == 0, "dragging slider must not commit before release")
+  debug_assert(m.dpi.untracked() != 800, "slider preview should follow pointer during A drag, got \{m.dpi.untracked()}")
+
+  // Mid-drag: Mouse A disconnects and Mouse B connects with 1200 DPI / LOD 1 (token=8).
+  reads.emit(Ev::Read(true, 1200, 1, 90, false, "Mouse B", 0, 8))
+  t.frame(ms=16.0)
+  debug_assert(m.device_name.untracked() == "Mouse B", "UI switched to Mouse B mid-drag")
+  debug_assert(m.dpi.untracked() == 1200, "Mouse B snapshot must immediately restore 1200 DPI, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 1, "Mouse B snapshot must immediately restore LOD 1, got \{m.lod.untracked()}")
+
+  // Continue moving and release the in-flight pointer gesture started on A:
+  // must NOT update B's preview and must NOT send any Set command to B.
+  t.move_to(x_after, cy)
+  t.release(x_after, cy)
+  debug_assert(sets.length() == 0, "releasing A's mid-drag gesture after switching to B must send 0 Sets, got \{sets.length()}")
+  debug_assert(m.dpi.untracked() == 1200, "Mouse B must still display 1200 DPI after release, got \{m.dpi.untracked()}")
+  debug_assert(m.lod.untracked() == 1, "Mouse B must still display LOD 1 after release, got \{m.lod.untracked()}")
+
+  // A brand-new drag gesture started on Mouse B still works normally and binds to token=8.
+  let slider_b = match t.get("DPI", role=view::Role::Slider) {
+    Some(d) => d
+    None => {
+      debug_assert(false, "DPI slider should remain present for Mouse B")
+      abort("missing slider B")
+    }
+  }
+  let cy_b = slider_b.y + slider_b.h / 2.0
+  t.drag(slider_b.x + slider_b.w * 0.25, cy_b, slider_b.x + slider_b.w * 0.5, cy_b)
+  debug_assert(sets.length() == 1, "new drag on Mouse B must emit 1 Set, got \{sets.length()}")
+  let (b_seq, b_tok, _, b_lod) = sets[0]
+  debug_assert(b_seq == 1 && b_tok == 8 && b_lod == 1, "expected Set(1, 8, _, 1) on Mouse B, got (\{b_seq}, \{b_tok}, _, \{b_lod})")
+  assert_clean_ui(t, "mid_drag_switch")
+
+  worker.close()
+  t.dispose()
+  lg::set_dark(None)
+}

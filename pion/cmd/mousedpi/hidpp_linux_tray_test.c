@@ -214,10 +214,15 @@ static void test_recovery_with_pending_ordinary_messages(void) {
     printf("PASS test_recovery_with_pending_ordinary_messages\n");
 }
 
-/* Case 4: Shutdown guard — once mousedpi_stop_waits() has run, tray recovery must not show window. */
+/* Case 4: Shutdown guard — scheduling idle callback BEFORE stop, then stopping before GLib dispatch,
+ * directly covers the in-callback guard (`linux_tray_show_idle_cb`); calling after stop covers the
+ * pre-submit guard (`hidpp_plat_notify_tray_show`). Neither may invoke mb_host_window_show(). */
 static void test_shutdown_blocks_tray_show(void) {
     reset_test_state(/*host_rc=*/1, /*item_rc=*/0);
+    /* Queue idle callback while still running, then stop before main loop dispatches it. */
+    mousedpi_notify_tray_show();
     mousedpi_stop_waits();
+    /* Also attempt a post-stop notification. */
     mousedpi_notify_tray_show();
 
     if (pump_glib_until_shown(1, 60u) || get_show_count() != 0) {
