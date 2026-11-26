@@ -433,7 +433,7 @@ void hidpp_plat_stop_watchers(void) {
 
     if (rl) {
         CFRunLoopPerformBlock(rl, kCFRunLoopCommonModes, ^{
-            CFRunLoopStop(rl);
+            CFRunLoopStop(CFRunLoopGetCurrent());
         });
         CFRunLoopWakeUp(rl);
         CFRelease(rl);

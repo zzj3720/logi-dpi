@@ -247,6 +247,7 @@ typedef void  *(*gio_dbus_call_sync_fn)(void *, const char *, const char *, cons
                                         const char *, void *, const void *, int, int, void *, void **);
 typedef void  *(*gio_var_new_fn)(const char *, ...);
 typedef void   (*gio_var_get_fn)(void *, const char *, ...);
+typedef const char *(*gio_var_type_str_fn)(void *);
 typedef int    (*gio_var_get_bool_fn)(void *);
 typedef size_t (*gio_var_n_children_fn)(void *);
 typedef void  *(*gio_var_get_child_fn)(void *, size_t);
@@ -261,6 +262,7 @@ typedef struct gio_dbus_syms {
     gio_dbus_call_sync_fn  dbus_call;
     gio_var_new_fn         var_new;
     gio_var_get_fn         var_get;
+    gio_var_type_str_fn    var_type_str;
     gio_var_get_bool_fn    var_get_bool;
     gio_var_n_children_fn  var_n_children;
     gio_var_get_child_fn   var_get_child;
@@ -279,6 +281,7 @@ static int gio_dbus_load(gio_dbus_syms_t *g) {
     *(void **)(&g->dbus_call)      = dlsym(sym_src, "g_dbus_connection_call_sync");
     *(void **)(&g->var_new)        = dlsym(sym_src, "g_variant_new");
     *(void **)(&g->var_get)        = dlsym(sym_src, "g_variant_get");
+    *(void **)(&g->var_type_str)   = dlsym(sym_src, "g_variant_get_type_string");
     *(void **)(&g->var_get_bool)   = dlsym(sym_src, "g_variant_get_boolean");
     *(void **)(&g->var_n_children) = dlsym(sym_src, "g_variant_n_children");
     *(void **)(&g->var_get_child)  = dlsym(sym_src, "g_variant_get_child_value");
@@ -288,7 +291,7 @@ static int gio_dbus_load(gio_dbus_syms_t *g) {
     *(void **)(&g->err_free)       = dlsym(sym_src, "g_error_free");
 
     if (!g->bus_get || !g->dbus_call || !g->var_new || !g->var_get ||
-        !g->var_get_bool || !g->var_n_children || !g->var_get_child ||
+        !g->var_type_str || !g->var_get_bool || !g->var_n_children || !g->var_get_child ||
         !g->var_get_str || !g->var_unref || !g->obj_unref || !g->err_free) {
         if (g->lib) {
             dlclose(g->lib);
@@ -359,7 +362,10 @@ static int dbus_sni_host_registered(const gio_dbus_syms_t *g, void *conn) {
         void *inner = NULL;
         g->var_get(prop_reply, "(v)", &inner);
         if (inner) {
-            host_ok = g->var_get_bool(inner) ? 1 : 0;
+            const char *ts = g->var_type_str(inner);
+            if (ts && strcmp(ts, "b") == 0) {
+                host_ok = g->var_get_bool(inner) ? 1 : 0;
+            }
             g->var_unref(inner);
         }
         g->var_unref(prop_reply);
@@ -442,17 +448,20 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
             void *inner = NULL;
             g.var_get(reply, "(v)", &inner);
             if (inner) {
-                size_t n = g.var_n_children(inner);
-                for (size_t i = 0; i < n; i++) {
-                    void *child = g.var_get_child(inner, i);
-                    if (child) {
-                        const char *s = g.var_get_str(child, NULL);
-                        if (s && strstr(s, needle) != NULL) {
-                            found = 1;
+                const char *ts = g.var_type_str(inner);
+                if (ts && strcmp(ts, "as") == 0) {
+                    size_t n = g.var_n_children(inner);
+                    for (size_t i = 0; i < n; i++) {
+                        void *child = g.var_get_child(inner, i);
+                        if (child) {
+                            const char *s = g.var_get_str(child, NULL);
+                            if (s && strstr(s, needle) != NULL) {
+                                found = 1;
+                            }
+                            g.var_unref(child);
                         }
-                        g.var_unref(child);
+                        if (found) break;
                     }
-                    if (found) break;
                 }
                 g.var_unref(inner);
             }
