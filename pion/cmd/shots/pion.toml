@@ -1,6 +1,6 @@
 [package]
 name = "dpi_shots"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
 dpi_ui = { path = "../../packages/dpi_ui" }
@@ -26,3 +26,6 @@ frameworks = [
   "CoreVideo",
   "WebKit",
 ]
+
+[link.linux]
+libs = ["pthread", "dl"]

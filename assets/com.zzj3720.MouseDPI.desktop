@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MouseDPI
+GenericName=Logitech DPI Controller
+Comment=Native Logitech HID++ 2.0 DPI and LOD controller
+Exec=mousedpi
+Icon=com.zzj3720.MouseDPI
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+StartupWMClass=com.zzj3720.MouseDPI
+StartupNotify=false

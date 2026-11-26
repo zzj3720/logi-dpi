@@ -1,14 +1,17 @@
 #!/bin/sh
 # Builds MouseDPI.exe on Windows (Git Bash): pionc compiles the Pion side; LLVM clang for the MSVC target (the
 # llvm-project release, with Visual Studio Build Tools' MSVC libraries and the Windows SDK) compiles invar's Windows
-# host (written for MSVC: WRL, WinRT, Windows SDK) and the Pion runtime, and links with lld (tools/win-cc.c turns
-# pionc's GCC-style link flags into MSVC ones).
+# host (written for MSVC: WRL, WinRT, Windows SDK), hidpp_core.c + hidpp_win.c, and the Pion runtime, and links with
+# lld (tools/win-cc.c turns pionc's GCC-style link flags into MSVC ones).
 #   PIONC=<pionc.exe> PION_QBE=<qbe.exe> PION_SRC=<pion checkout> [LLVM_BIN=<dir with clang.exe>] sh tools/build-win.sh
 set -e
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 OUT="$ROOT/out"
 mkdir -p "$OUT"
-LLVM_BIN="${LLVM_BIN:-/c/Users/3720/Apps/llvm/bin}"
+LLVM_BIN="${LLVM_BIN:-/c/Program Files/LLVM/bin}"
+if [ ! -x "$LLVM_BIN/clang.exe" ] && [ -x "/c/Users/3720/Apps/llvm/bin/clang.exe" ]; then
+  LLVM_BIN="/c/Users/3720/Apps/llvm/bin"
+fi
 export PION_CLANG="$(cygpath -w "$LLVM_BIN/clang.exe")"
 sh "$ROOT/tools/deps.sh"
 cd "$ROOT"

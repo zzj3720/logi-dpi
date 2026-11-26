@@ -1,43 +1,132 @@
-// MouseDPI's window drawn offscreen over a stand-in mouse (invar's Apple Metal renderer, `film::picture`):
+// MouseDPI offscreen shots and 60fps interaction video via invar `film` (macOS Apple Metal & Linux EGL/GLES3 llvmpipe):
 //   DPI_SHOTS=<dir> DPI_PICTURE=<abs path of assets/mouse.png> dpi_shots
+// Exits with code 0 only if every static PNG and MP4 video succeeds.
 
 import "dpi_ui"
 import "film"
 import "host"
 import "lg"
 import "ui"
+import "view"
 
-fn shot(dir : String, picture : String, name : String, dark : Bool, connected : Bool, dpi : Int, lod : Int, script~ : String = "", frame~ : Int = -1) -> Bool {
-  lg::set_dark(Some(dark))
+fn make_mouse(
+  connected : Bool,
+  dpi : Int,
+  lod : Int,
+  battery : Int,
+  perm_denied~ : Bool = false,
+  device_name~ : String = "PRO X2 SUPERSTRIKE",
+) -> dpi_ui::Mouse {
   let m = dpi_ui::Mouse::new()
   m.connected.set(connected)
   m.dpi.set(dpi)
   m.lod.set(lod)
-  m.battery.set(if connected { 76 } else { -1 })
+  m.battery.set(battery)
   m.autostart.set(true)
-  let worker = ui::Worker::inline(dpi_ui::stand_in(76))
+  m.perm_denied.set(perm_denied)
+  m.device_name.set(device_name)
+  m
+}
+
+fn shot(
+  dir : String,
+  picture : String,
+  name : String,
+  dark : Bool,
+  connected : Bool,
+  dpi : Int,
+  lod : Int,
+  battery : Int,
+  perm_denied~ : Bool = false,
+  show_window_controls~ : Bool = true,
+  macos_inset~ : Bool = false,
+  close_label~ : String = "关闭到托盘",
+  platform~ : Int = 3,
+  device_name~ : String = "PRO X2 SUPERSTRIKE",
+) -> Bool {
+  lg::set_dark(Some(dark))
+  let m = make_mouse(connected, dpi, lod, battery, perm_denied=perm_denied, device_name=device_name)
+  let worker = ui::Worker::inline(dpi_ui::stand_in(battery, device_name=device_name, perm_denied=perm_denied))
   let path = "\{dir}/\{name}.png"
-  let tree = fn(root) { dpi_ui::app(root, m, worker, picture=picture) }
-  let ok = if frame >= 0 {
-    film::picture(tree, path=path, w=780.0, h=360.0, scale=3.0, dark=dark, script=script, frame=frame, theme=lg::ui_theme)
-  } else {
-    film::picture(tree, path=path, w=780.0, h=360.0, scale=3.0, dark=dark, at=1000.0, theme=lg::ui_theme)
+  let tree = fn(root : view::View) -> Unit {
+    dpi_ui::app(
+      root,
+      m,
+      worker,
+      picture=picture,
+      show_window_controls=show_window_controls,
+      macos_inset=macos_inset,
+      close_label=close_label,
+    )
   }
+  let ok = film::picture(
+    tree,
+    path=path,
+    w=780.0,
+    h=360.0,
+    scale=3.0,
+    platform=platform,
+    dark=dark,
+    inset=macos_inset,
+    at=500.0,
+    theme=lg::ui_theme,
+  )
   worker.close()
   film::say("dpi_shots: \{path} \{ok}")
   ok
 }
 
-fn main() -> Unit {
-  host::install()
-  let dir = ui::env("DPI_SHOTS")
-  let picture = ui::env("DPI_PICTURE")
-  let _ = shot(dir, picture, "dark", true, true, 1500, 2)
-  let _ = shot(dir, picture, "light", false, true, 1600, 1)
-  let _ = shot(dir, picture, "dark-offline", true, false, 800, 2)
-  // A finger holding the slider's thumb and dragging it right: the thumb turns to a glass lens.
-  let at = ui::env("DPI_DRAG")
-  if at != "" {
-    let _ = shot(dir, picture, "dark-drag", true, true, 1500, 2, script="wait 300\nholdon 500 90 0 500 @\{at}\nwait 300", frame=50)
+fn record_interaction(dir : String, picture : String) -> Bool {
+  lg::set_dark(Some(true))
+  let m = make_mouse(true, 1200, 2, 76)
+  let worker = ui::Worker::inline(dpi_ui::stand_in(76))
+  let out = "\{dir}/interact.mp4"
+  let tree = fn(root : view::View) -> Unit {
+    dpi_ui::app(
+      root,
+      m,
+      worker,
+      picture=picture,
+      show_window_controls=true,
+      macos_inset=false,
+      close_label="关闭",
+    )
   }
+  // 60fps real-time script: preset click -> slider drag across track -> LOD switch ("高") -> preset click.
+  let script = "wait 200\npress 1600\nwait 220\ndrag 423 158 180 0 420\nwait 220\nclick 492 279\nwait 220\npress 800\nwait 280"
+  let ok = film::film(
+    tree,
+    script=script,
+    out=out,
+    w=780.0,
+    h=360.0,
+    scale=2.0,
+    platform=5,
+    dark=true,
+    fps=60,
+    theme=lg::ui_theme,
+  )
+  worker.close()
+  film::say("dpi_shots: \{out} \{ok}")
+  ok
+}
+
+fn main() -> Int {
+  host::install()
+  let dir_env = ui::env("DPI_SHOTS")
+  let dir = if dir_env != "" { dir_env } else { "out/shots" }
+  let pic_env = ui::env("DPI_PICTURE")
+  let picture = if pic_env != "" { pic_env } else { "assets/mouse.png" }
+
+  let mut all_ok = true
+  all_ok = shot(dir, picture, "dark", true, true, 1500, 2, 76) && all_ok
+  all_ok = shot(dir, picture, "light", false, true, 1600, 1, 76) && all_ok
+  all_ok = shot(dir, picture, "dark-offline", true, false, 800, 2, -1) && all_ok
+  all_ok = shot(dir, picture, "dark-low-battery", true, true, 1600, 2, 15) && all_ok
+  all_ok = shot(dir, picture, "dark-perm-denied", true, false, 800, 2, -1, perm_denied=true, close_label="关闭", platform=5) && all_ok
+  all_ok = shot(dir, picture, "macos-dark", true, true, 1600, 2, 76, show_window_controls=false, macos_inset=true, platform=0) && all_ok
+  all_ok = shot(dir, picture, "winlinux-light", false, true, 1200, 3, 88, show_window_controls=true, macos_inset=false, close_label="关闭", platform=5) && all_ok
+  all_ok = record_interaction(dir, picture) && all_ok
+
+  if all_ok { 0 } else { 1 }
 }

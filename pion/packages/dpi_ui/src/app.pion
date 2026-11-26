@@ -1,9 +1,9 @@
-// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, no cards; its controls `flat`), the
-// Liquid Glass floats over it (the PageShell's bar islands and the controls), never glass on glass. The page shell's top
-// bar is the window's title bar (the window has none of the system's). What the window shows comes from `Mouse`
-// (signals the worker's events write); what it asks goes to the worker (`Cmd`).
+// MouseDPI's window, as invar's `lg` lays out an app: the Content Layer is solid (`lg::surface()`, no cards;
+// controls inside `<lg::PageShell>` body inherit `SurfaceContext::Content` automatically), the Liquid Glass floats
+// over it (the PageShell's bar islands), never glass on glass. The page shell's top bar is the window's title bar
+// (inset on all three platforms). What the window shows comes from `Mouse` (signals the worker's events write);
+// what it asks goes to the worker (`Cmd`).
 
-import "hostapi"
 import "lg"
 import "signals"
 import "ui"
@@ -16,6 +16,8 @@ pub struct Mouse {
   pub lod : signals::Signal[Int]
   pub battery : signals::Signal[Int]
   pub autostart : signals::Signal[Bool]
+  pub perm_denied : signals::Signal[Bool]
+  pub device_name : signals::Signal[String]
 }
 
 pub fn Mouse::new() -> Mouse {
@@ -25,6 +27,8 @@ pub fn Mouse::new() -> Mouse {
     lod: signals::signal(2),
     battery: signals::signal(-1),
     autostart: signals::signal(false),
+    perm_denied: signals::signal(false),
+    device_name: signals::signal("PRO X2 SUPERSTRIKE"),
   }
 }
 
@@ -34,10 +38,6 @@ pub let dpi_least : Int = 200
 pub let dpi_most : Int = 4000
 
 pub let dpi_step : Int = 50
-
-/// How long after the window asks for a DPI/LOD a read is not taken for them (hostapi::now ms): a read the device side
-/// did before the write landed is older than what is shown.
-let settle_ms : Double = 1500.0
 
 fn ink() -> Int64 {
   lg::surface().ink
@@ -51,16 +51,55 @@ fn ink_tertiary() -> Int64 {
   lg::surface().ink_tertiary
 }
 
-/// The worker's events into `m` (bound before every frame; `asked_at[0]` is when the window last asked for a DPI/LOD).
-fn take(m : Mouse, asked_at : Array[Double], ev : Ev) -> Unit {
+/// The worker's events into `m` (bound before every frame; `pending_seq[0]` and `pending_token[0]` track the in-flight
+/// optimistic write for one target device, and `active_token` is the reactive device target token of the latest snapshot).
+fn take(
+  m : Mouse,
+  pending_seq : Array[Int],
+  pending_token : Array[Int],
+  active_token : signals::Signal[Int],
+  ev : Ev,
+) -> Unit {
   match ev {
-    Ev::Read(ok, dpi, lod, battery) => {
+    Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq, target_token) => {
+      let target_changed = target_token != active_token.untracked()
+      let had_pending = pending_seq[0] > 0
+      if target_changed {
+        active_token.set(target_token)
+      }
+      if target_changed || (had_pending && pending_token[0] != target_token) {
+        // Target switched: drop any unconfirmed optimistic state from the previous device immediately
+        // so its DPI/LOD can never be combined with the new device's target_token.
+        pending_seq[0] = 0
+        pending_token[0] = 0
+      }
       m.connected.set(ok)
-      if ok {
-        if hostapi::now() - asked_at[0] > settle_ms {
+      m.perm_denied.set(perm_denied)
+      if device_name != "" {
+        m.device_name.set(device_name)
+      }
+      let accept = pending_seq[0] == 0 || applied_seq >= pending_seq[0]
+      if accept {
+        if pending_seq[0] > 0 && applied_seq >= pending_seq[0] {
+          pending_seq[0] = 0
+          pending_token[0] = 0
+        }
+        if ok {
           m.dpi.set(dpi)
           m.lod.set(lod)
+        } else if had_pending {
+          // Offline snapshot after a failed or cancelled user write still carries the last confirmed device values
+          // (device range starts at 100 DPI, below the 200 DPI slider floor): undo the optimistic values
+          // without clobbering config-seeded DPI on an offline startup (where had_pending is false).
+          if dpi >= 100 {
+            m.dpi.set(dpi)
+          }
+          if lod >= 1 && lod <= 3 {
+            m.lod.set(lod)
+          }
         }
+      }
+      if ok {
         m.battery.set(battery)
       }
     }
@@ -68,45 +107,65 @@ fn take(m : Mouse, asked_at : Array[Double], ev : Ev) -> Unit {
   }
 }
 
-/// The top bar's islands: the battery, refresh, and the window's own minimize / close (to the tray).
-fn bar_islands(tr : view::View, m : Mouse, worker : ui::Worker[Cmd, Ev], window_act : (Int) -> Unit) -> Unit {
-  <ui::Show in={tr} when=>{m.connected.get() && m.battery.get() >= 0} at_once>
-    <lg::Badge
-      label_by=>{"电量 \{m.battery.get()}%"}
-      tone={if m.battery.get() <= 20 { .Warning } else { .Success }}
-      dot
-    />
+/// The top bar's islands: the responsive battery badge, refresh, and (on Windows/Linux) minimize / close.
+fn bar_islands(
+  tr : view::View,
+  m : Mouse,
+  worker : ui::Worker[Cmd, Ev],
+  window_act : (Int) -> Unit,
+  show_window_controls : Bool,
+  close_label : String,
+) -> Unit {
+  <ui::Show in={tr} when=>{m.connected.get() && m.battery.get() > 20} at_once>
+    <lg::Badge label_by=>{"电量 \{m.battery.get()}%"} tone={.Success} dot />
+  </ui::Show>
+  <ui::Show in={tr} when=>{m.connected.get() && m.battery.get() >= 0 && m.battery.get() <= 20} at_once>
+    <lg::Badge label_by=>{"电量 \{m.battery.get()}%"} tone={.Warning} dot />
   </ui::Show>
   <lg::BarPillGroup in={tr} height={36.0} label="鼠标">
     <lg::Button flat ghost height={32.0} pad_x={10.5} label="刷新" on_press=>{ let _ = worker.send(Cmd::Refresh) }>
       <lg::Icon kind={.Refresh} size={15.0} />
     </lg::Button>
   </lg::BarPillGroup>
-  <lg::BarPillGroup in={tr} height={36.0} label="窗口">
-    <lg::Button flat ghost height={32.0} pad_x={10.5} label="最小化" on_press=>{ window_act(1) }>
-      <lg::Icon kind={.Minus} size={15.0} />
-    </lg::Button>
-    <lg::Button flat ghost height={32.0} pad_x={10.5} label="关闭到托盘" on_press=>{ window_act(3) }>
-      <lg::Icon kind={.Close} size={15.0} />
-    </lg::Button>
-  </lg::BarPillGroup>
+  if show_window_controls {
+    <lg::BarPillGroup in={tr} height={36.0} label="窗口">
+      <lg::Button flat ghost height={32.0} pad_x={10.5} label="最小化" on_press=>{ window_act(1) }>
+        <lg::Icon kind={.Minus} size={15.0} />
+      </lg::Button>
+      <lg::Button flat ghost height={32.0} pad_x={10.5} label={close_label} on_press=>{ window_act(3) }>
+        <lg::Icon kind={.Close} size={15.0} />
+      </lg::Button>
+    </lg::BarPillGroup>
+  }
 }
 
-/// The left: the mouse itself and whether it is there, on the page (no card round it).
-fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String) -> Unit {
+/// The left: the mouse itself and connection/permission state, on the page (no card round it).
+fn MouseSide(parent : view::View, m~ : Mouse, picture~ : String, perm_hint~ : String) -> Unit {
   <ui::Col in={parent} align={.Middle} along={.Middle} gap={10.0} width={196.0} rigid>
     <ui::Box width={120.0} height={180.0} alpha_by=>{if m.connected.get() { 1.0 } else { 0.45 }}>
       <ui::Image src={picture} width={120.0} height={180.0} contain max_px={640} />
     </ui::Box>
-    <ui::Text
-      size={12.5}
-      color_by=>{ink_secondary()}
-      text_by=>{if m.connected.get() { "LIGHTSPEED · HID++ 2.0" } else { "未连接 · 正在找接收器" }}
-    />
+    <ui::Box pad_x={8.0}>
+      <ui::Text
+        size={12.5}
+        wrap
+        center
+        color_by=>{ink_secondary()}
+        text_by=>{
+          if m.perm_denied.get() {
+            perm_hint
+          } else if m.connected.get() {
+            "Logitech HID++ 2.0"
+          } else {
+            "未连接，正在查找接收器"
+          }
+        }
+      />
+    </ui::Box>
   </ui::Col>
 }
 
-/// A row of the settings card: its name, then what sets it.
+/// A row of the settings list: its name, then what sets it.
 fn SettingRow(parent : view::View, name~ : String, children~ : (view::View) -> Unit) -> Unit {
   let _ = ui::Row(parent, align=.Middle, gap=12.0, height=52.0, pad_x=4.0, rigid=true, children=fn(r : view::View) -> Unit {
     <ui::Box in={r} width={72.0}>
@@ -116,13 +175,61 @@ fn SettingRow(parent : view::View, name~ : String, children~ : (view::View) -> U
   })
 }
 
-/// A hairline between the settings card's rows.
+/// A hairline between the settings rows.
 fn Hairline(parent : view::View) -> Unit {
   <ui::Box in={parent} height={0.5} bg_by=>{lg::surface().separator} rigid />
 }
 
+/// Keyed DPI slider: rebuilding by `active_token` immediately tears down the previous slider node and cancels
+/// any in-flight pointer capture whenever the target mouse switches mid-drag.
+fn DpiSlider(
+  parent : view::View,
+  m~ : Mouse,
+  active_token~ : signals::Signal[Int],
+  ask_for~ : (Int, Int, Int) -> Unit,
+) -> Unit {
+  let slider_host = ui::Col(parent, rigid=true)
+  slider_host.each(
+    fn() { [active_token.get()] },
+    fn(tok : Int) { tok },
+    fn(slot : view::View, tok_sig : signals::Signal[Int]) -> Unit {
+      let tok = tok_sig.untracked()
+      <lg::Slider
+        in={slot}
+        value_by=>{
+          let v = m.dpi.get()
+          let clamped = if v < dpi_least { dpi_least } else if v > dpi_most { dpi_most } else { v }
+          clamped.to_double()
+        }
+        on_change={fn(v : Double) -> Unit {
+          if tok == active_token.untracked() {
+            m.dpi.set(v.to_int())
+          }
+        }}
+        on_commit={fn(v : Double) -> Unit {
+          if tok == active_token.untracked() {
+            ask_for(tok, v.to_int(), m.lod.untracked())
+          }
+        }}
+        label="DPI"
+        min={dpi_least.to_double()}
+        max={dpi_most.to_double()}
+        step={dpi_step.to_double()}
+      />
+    },
+    at_once=true,
+  )
+}
+
 /// The right: the DPI read out large with its stepper and slider on the page, then the settings as rows between hairlines.
-fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ : (Int, Int) -> Unit) -> Unit {
+fn DpiSide(
+  parent : view::View,
+  m~ : Mouse,
+  worker~ : ui::Worker[Cmd, Ev],
+  active_token~ : signals::Signal[Int],
+  ask~ : (Int, Int) -> Unit,
+  ask_for~ : (Int, Int, Int) -> Unit,
+) -> Unit {
   let set_dpi = fn(v : Int) -> Unit {
     if v != m.dpi.untracked() {
       ask(v, m.lod.untracked())
@@ -146,22 +253,14 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
           step={dpi_step}
           label="DPI ±50"
           show_value={false}
-          flat
         />
       </ui::Box>
     </ui::Row>
     // Dragging the slider moves the very pointer whose DPI it sets: the read-out follows the hand (`on_change`),
-    // the mouse is written once the hand lets go (`on_commit`).
+    // the mouse is written once the hand lets go (`on_commit`). Keying the slider by `active_token` immediately
+    // disposes the old slider and cancels any in-flight pointer capture if the target mouse switches mid-drag.
     <ui::Col gap={6.0} pad_x={4.0} rigid>
-      <lg::Slider
-        value_by=>{m.dpi.get().to_double()}
-        on_change={fn(v : Double) -> Unit { m.dpi.set(v.to_int()) }}
-        on_commit={fn(v : Double) -> Unit { ask(v.to_int(), m.lod.untracked()) }}
-        label="DPI"
-        min={dpi_least.to_double()}
-        max={dpi_most.to_double()}
-        step={dpi_step.to_double()}
-      />
+      <DpiSlider m={m} active_token={active_token} ask_for={ask_for} />
       <ui::Row along={.Between} rigid>
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="200" />
         <ui::Text size={11.0} weight={500} color_by=>{ink_tertiary()} text="1000" />
@@ -173,16 +272,15 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
     <ui::Col gap={0.0} rigid>
       <Hairline />
       <SettingRow name="常用档位">
-        <lg::Chip flat label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
-        <lg::Chip flat label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
-        <lg::Chip flat label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
-        <lg::Chip flat label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
-        <lg::Chip flat label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
+        <lg::Chip label="400" selected_by=>{m.dpi.get() == 400} on_press=>{ set_dpi(400) } />
+        <lg::Chip label="800" selected_by=>{m.dpi.get() == 800} on_press=>{ set_dpi(800) } />
+        <lg::Chip label="1200" selected_by=>{m.dpi.get() == 1200} on_press=>{ set_dpi(1200) } />
+        <lg::Chip label="1600" selected_by=>{m.dpi.get() == 1600} on_press=>{ set_dpi(1600) } />
+        <lg::Chip label="3200" selected_by=>{m.dpi.get() == 3200} on_press=>{ set_dpi(3200) } />
       </SettingRow>
       <Hairline />
       <SettingRow name="抬起距离">
         <lg::Segmented
-          flat
           labels={["低", "中", "高"]}
           selected_by=>{
             let l = m.lod.get()
@@ -204,15 +302,20 @@ fn DpiSide(parent : view::View, m~ : Mouse, worker~ : ui::Worker[Cmd, Ev], ask~ 
           label="开机自启"
         />
         <ui::Box pad_x={4.0}>
-          <ui::Text size={12.0} color_by=>{ink_tertiary()} text="改动自动保存 · 唤醒后自动恢复" />
+          <ui::Text size={12.0} color_by=>{ink_tertiary()} text="改动自动保存，唤醒后自动恢复" />
         </ui::Box>
       </SettingRow>
     </ui::Col>
   </ui::Col>
 }
 
-/// The whole window. `window_act`: the window's own buttons (1 minimize, 3 close: put away to the tray); `reads`: what
-/// the device side reads without being asked (as the mouse wakes, every 30 s).
+/// The whole window.
+/// - `window_act`: the window's own buttons (1 minimize, 3 close).
+/// - `reads`: what the device side reads without being asked (as the mouse wakes, every 30 s).
+/// - `show_window_controls`: true on Windows/Linux (custom minimize/close buttons), false on macOS (native traffic lights).
+/// - `macos_inset`: true on macOS to reserve a reactive 68pt leading spacer while traffic lights are inset.
+/// - `close_label`: accessible label for the close button ("关闭到托盘" when tray is available, else "关闭").
+/// - `perm_hint`: platform-specific guidance shown when HID permission is denied.
 pub fn app(
   root : view::View,
   m : Mouse,
@@ -220,34 +323,68 @@ pub fn app(
   window_act~ : (Int) -> Unit = fn(_w : Int) -> Unit { () },
   reads? : ui::EventQueue[Ev],
   picture~ : String = "mouse.png",
+  show_window_controls~ : Bool = true,
+  macos_inset~ : Bool = false,
+  close_label~ : String = "关闭到托盘",
+  perm_hint~ : String = "请安装 udev 规则或在系统设置中授予权限",
 ) -> Unit {
-  let asked_at : Array[Double] = [-100000.0]
-  worker.bind(fn(ev : Ev) -> Unit { take(m, asked_at, ev) })
+  let next_seq : Array[Int] = [0]
+  let pending_seq : Array[Int] = [0]
+  let pending_token : Array[Int] = [0]
+  let active_token : signals::Signal[Int] = signals::signal(0)
+  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, pending_token, active_token, ev) })
   // reads the device side does on its own (a thread that waits on them), taken as the worker's are
   match reads {
     Some(q) => {
-      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, asked_at, ev) }) })
+      let _ = ui::on_before_frame(fn() {
+        let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, pending_token, active_token, ev) })
+      })
     }
     None => ()
   }
-  // shown at once; written by the worker (the newest asked), its read back taken once it has settled
-  let ask = fn(dpi : Int, lod : Int) -> Unit {
-    asked_at[0] = hostapi::now()
+  // shown at once; written by the worker with a monotonic sequence number and the UI-seen device target token
+  // so stale reads are ignored, target switches cancel previous optimistic state, and real readbacks apply immediately.
+  let ask_for = fn(expected_tok : Int, dpi : Int, lod : Int) -> Unit {
+    if expected_tok != active_token.untracked() {
+      return
+    }
+    let seq = next_seq[0] + 1
+    next_seq[0] = seq
+    pending_seq[0] = seq
+    pending_token[0] = expected_tok
     m.dpi.set(dpi)
     m.lod.set(lod)
-    let _ = worker.send(Cmd::Set(dpi, lod))
+    let _ = worker.send(Cmd::Set(seq, expected_tok, dpi, lod))
+  }
+  let ask = fn(dpi : Int, lod : Int) -> Unit {
+    ask_for(active_token.untracked(), dpi, lod)
   }
   <lg::PageShell
     in={root}
-    title="PRO X2 SUPERSTRIKE"
-    subtitle_by=>{if m.connected.get() { "已连接" } else { "未连接" }}
+    title_by=>{m.device_name.get()}
+    subtitle_by=>{
+      if m.perm_denied.get() {
+        "需要 HID 权限"
+      } else if m.connected.get() {
+        "已连接"
+      } else {
+        "未连接"
+      }
+    }
     moves_window
     grouped
-    trailing={fn(tr : view::View) -> Unit { bar_islands(tr, m, worker, window_act) }}
+    leading={fn(l : view::View) -> Unit {
+      <ui::Show in={l} when=>{macos_inset && ui::window_inset_now()} at_once>
+        <ui::Spacer width={68.0} />
+      </ui::Show>
+    }}
+    trailing={fn(tr : view::View) -> Unit {
+      bar_islands(tr, m, worker, window_act, show_window_controls, close_label)
+    }}
   >
     <ui::Row pad_x={16.0} gap={12.0} align={.Start}>
-      <MouseSide m={m} picture={picture} />
-      <DpiSide m={m} worker={worker} ask={ask} />
+      <MouseSide m={m} picture={picture} perm_hint={perm_hint} />
+      <DpiSide m={m} worker={worker} active_token={active_token} ask={ask} ask_for={ask_for} />
     </ui::Row>
   </lg::PageShell>
 }

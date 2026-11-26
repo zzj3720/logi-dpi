@@ -1,11 +1,10 @@
-// MouseDPI for Windows: the Liquid Glass window (dpi_ui) over the HID++ 2.0 side (hidpp_win.c: the receiver, DPI/LOD,
-// battery, config.ini, autostart, restoring the DPI as the mouse wakes).
+// MouseDPI for macOS, Linux, and Windows: the Liquid Glass window (dpi_ui) over the shared HID++ 2.0 protocol core
+// (hidpp_core.c + platform transport hidpp_macos.m / hidpp_linux.c / hidpp_win.c).
 //
-// The program is an app of invar's Windows host (MBUI_APP_ID in assets/mbui_env.txt): the host runs it once per person
-// (a second start brings the window back), puts the window away to its tray icon as it closes, and brings it back from
-// there; the tray menu is the app's (menu_setup). Two threads beside the window's: the worker does what the window
-// asks (ui::Worker), the watcher hands over each read of the mouse the C side's own threads did (every 30 s, after a
-// write, as the mouse wakes).
+// Two background threads run beside the UI thread:
+// - the worker thread handles commands from the window (`ui::Worker`) without blocking the render thread;
+// - the watcher thread initializes/restores DPI on startup and delivers atomic snapshots whenever `mousedpi_wait_rev`
+//   advances (wake restore, 30 s refresh, or write completion).
 
 import "dpi_ui"
 import "host"
@@ -24,57 +23,126 @@ extern "C" fn c_request_refresh() -> Unit = "mousedpi_request_refresh"
 
 extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_set"
 
+extern "C" fn c_request_set_seq(seq : Int, dpi : Int, lod : Int) -> Unit = "mousedpi_request_set_seq"
+
+extern "C" fn c_request_set_target(seq : Int, target_token : Int, dpi : Int, lod : Int) -> Unit = "mousedpi_request_set_target"
+
+extern "C" fn c_request_wake_restore() -> Unit = "mousedpi_request_wake_restore"
+
 extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
 
 extern "C" fn c_wait_rev(seen : Int) -> Int = "mousedpi_wait_rev"
 
 extern "C" fn c_stop_waits() -> Unit = "mousedpi_stop_waits"
 
-extern "C" fn c_connected() -> Int = "mousedpi_get_connected"
+extern "C" fn c_snapshot_capture() -> Unit = "mousedpi_snapshot_capture"
 
-extern "C" fn c_dpi_x() -> Int = "mousedpi_get_dpi_x"
+extern "C" fn c_snap_rev() -> Int = "mousedpi_snap_rev"
 
-extern "C" fn c_lod() -> Int = "mousedpi_get_lod"
+extern "C" fn c_snap_applied_seq() -> Int = "mousedpi_snap_applied_seq"
 
-extern "C" fn c_battery() -> Int = "mousedpi_get_battery"
+extern "C" fn c_snap_target_token() -> Int = "mousedpi_snap_target_token"
+
+extern "C" fn c_snap_connected() -> Int = "mousedpi_snap_connected"
+
+extern "C" fn c_snap_dpi_x() -> Int = "mousedpi_snap_dpi_x"
+
+extern "C" fn c_snap_lod() -> Int = "mousedpi_snap_lod"
+
+extern "C" fn c_snap_battery() -> Int = "mousedpi_snap_battery"
+
+extern "C" fn c_snap_perm_denied() -> Int = "mousedpi_snap_perm_denied"
+
+extern "C" fn c_snap_device_name_dup() -> Ptr = "mousedpi_snap_device_name_dup"
+
+extern "C" fn c_picture_path_dup() -> Ptr = "mousedpi_picture_path_dup"
+
+extern "C" fn c_can_hide_to_tray() -> Int = "mousedpi_can_hide_to_tray"
+
+extern "C" fn c_wait_tray_ready(timeout_ms : Int) -> Int = "mousedpi_wait_tray_ready"
+
+extern "C" fn c_notify_tray_show() -> Unit = "mousedpi_notify_tray_show"
 
 extern "C" fn c_autostart() -> Int = "mousedpi_get_autostart"
 
 extern "C" fn c_set_autostart(on : Int) -> Int = "mousedpi_set_autostart"
 
-/// The C side's last read, as the window takes it.
-fn read_now(ok : Int) -> dpi_ui::Ev {
-  dpi_ui::Ev::Read(ok != 0, c_dpi_x(), c_lod(), c_battery())
+fn take_c_str(p : Ptr) -> String {
+  if p == ptr_null() {
+    ""
+  } else {
+    let s = cstr_to_str(p)
+    ptr_free(p)
+    s
+  }
+}
+
+/// Capture an atomic snapshot of the C side's state and return `(Ev::Read, snap_rev)`.
+fn read_snapshot() -> (dpi_ui::Ev, Int) {
+  c_snapshot_capture()
+  let ev = dpi_ui::Ev::Read(
+    c_snap_connected() != 0,
+    c_snap_dpi_x(),
+    c_snap_lod(),
+    c_snap_battery(),
+    c_snap_perm_denied() != 0,
+    take_c_str(c_snap_device_name_dup()),
+    c_snap_applied_seq(),
+    c_snap_target_token(),
+  )
+  (ev, c_snap_rev())
 }
 
 /// What the window asks, on the worker's thread (none of it blocks: the C side's refresher thread does the HID++).
 fn handle(cmd : dpi_ui::Cmd, emit : (dpi_ui::Ev) -> Unit) -> Unit {
   match cmd {
     dpi_ui::Cmd::Refresh => c_request_refresh()
-    dpi_ui::Cmd::Set(dpi, lod) => c_request_set(dpi, lod)
+    dpi_ui::Cmd::WakeRestore => c_request_wake_restore()
+    dpi_ui::Cmd::Set(seq, target_token, dpi, lod) => c_request_set_target(seq, target_token, dpi, lod)
     dpi_ui::Cmd::Autostart(on) => emit(dpi_ui::Ev::Autostarts(c_set_autostart(if on { 1 } else { 0 }) != 0))
   }
 }
 
-/// The tray icon's menu (the host's icon; its words the app's).
+/// Tray menu for Windows and Linux (only Show + Quit).
 let tray_menu : String = "[{\"role\":\"tray\",\"items\":[{\"title\":\"打开 MouseDPI\",\"role\":\"show\"},{\"separator\":true},{\"title\":\"退出\",\"role\":\"quit\"}]}]"
+
+/// Full macOS menu bar (App menu + Window menu) plus opt-in menu bar status item.
+let macos_menu : String = "[{\"title\":\"MouseDPI\",\"items\":[{\"title\":\"关于 {app}\",\"role\":\"about\"},{\"separator\":true},{\"title\":\"隐藏 {app}\",\"role\":\"hide\"},{\"title\":\"隐藏其他\",\"role\":\"hideOthers\"},{\"title\":\"全部显示\",\"role\":\"showAll\"},{\"separator\":true},{\"title\":\"退出 {app}\",\"role\":\"quit\"}]},{\"title\":\"窗口\",\"role\":\"window\",\"items\":[{\"title\":\"关闭\",\"role\":\"close\"},{\"title\":\"最小化\",\"role\":\"minimize\"},{\"title\":\"缩放\",\"role\":\"zoom\"},{\"separator\":true},{\"title\":\"进入全屏幕\",\"role\":\"fullScreen\"},{\"separator\":true},{\"title\":\"前置全部窗口\",\"role\":\"front\"}]},{\"role\":\"tray\",\"macos\":true,\"symbol\":\"computermouse.fill\",\"tooltip\":\"MouseDPI\",\"items\":[{\"title\":\"打开 MouseDPI\",\"role\":\"show\"},{\"separator\":true},{\"title\":\"退出\",\"role\":\"quit\"}]}]"
 
 fn main(world : World) -> Int {
   host::install()
-  // 780 × 360 points (what the page holds), no smaller than 640 × 340, the page the whole window (no title bar of the system's)
-  hostapi::window_setup(640.0, 340.0, 780.0, 360.0, true)
+  let plat = hostapi::platform()
+  let is_macos = plat == 0
+  let is_windows = plat == 3
+  let is_linux = plat == 5
+  // 780 × 360 points, no smaller than 640 × 340, inset title bar on all three desktop platforms.
+  hostapi::window_setup(640.0, 340.0, 780.0, 360.0, inset=true)
   hostapi::window_center()
-  let hidden = c_started_hidden() != 0
+  let want_tray = c_started_hidden() != 0
+  let can_tray = c_can_hide_to_tray() != 0
+  let linux_tray_watch = is_linux && want_tray && can_tray
+  let hidden = want_tray && can_tray
   if hidden {
-    // started with Windows: in the tray till it is brought back
+    // Started in tray mode (e.g. login autostart) when a tray host is available.
+    // On Linux this ensures window_shown = 1 in the host (never stuck in held state on tray click),
+    // while the watcher task restores the window if SNI registration fails or the tray watcher disappears.
     hostapi::window_hide()
   } else {
-    // out of sight till its first frame is drawn, centred, then shown (no jump, no blank window)
+    // Keep out of sight until its first frame is drawn, centered, then shown (no jump, no blank flash).
     hostapi::window_hold()
   }
-  hostapi::menu_setup(tray_menu)
-  // shown as config.ini last had it till the mouse answers (opening the receiver can take ~350 ms while the GPU's
-  // driver loads beside it): taken as there, not "未连接" for a moment
+  hostapi::menu_setup(if is_macos { macos_menu } else { tray_menu })
+  let pic_raw = take_c_str(c_picture_path_dup())
+  let picture = if pic_raw != "" { pic_raw } else { "mouse.png" }
+  let close_label = if is_windows || can_tray { "关闭到托盘" } else { "关闭" }
+  let perm_hint = if is_macos {
+    "请在 系统设置 → 隐私与安全性 → 输入监控 中授权"
+  } else if is_windows {
+    "请检查 HID 设备访问权限后重试"
+  } else {
+    "请安装 udev 规则后重新插拔接收器"
+  }
+  // Seed initial state from config.ini until the receiver answers so startup never flashes "未连接".
   let m = dpi_ui::Mouse::new()
   m.connected.set(true)
   m.dpi.set(c_peek_config(0))
@@ -82,25 +150,85 @@ fn main(world : World) -> Int {
   m.autostart.set(c_autostart() != 0)
   let (worker, ctx) : (ui::Worker[dpi_ui::Cmd, dpi_ui::Ev], ui::WorkerCtx[dpi_ui::Cmd, dpi_ui::Ev]) = ui::Worker::pair()
   let reads : ui::EventQueue[dpi_ui::Ev] = ui::EventQueue::new()
+  // Register system lifecycle listener before ui::run so Shown/wake events are never missed.
+  ui::on_message(hostapi::system_channel, fn(json : String, _bytes : Option[Bytes]) -> Unit {
+    for said in hostapi::system_said(json) {
+      match said {
+        hostapi::SystemSaid::Shown(away) => {
+          if is_windows {
+            let _ = worker.send(dpi_ui::Cmd::Refresh)
+          } else if away >= 5000.0 {
+            let _ = worker.send(dpi_ui::Cmd::WakeRestore)
+          } else {
+            let _ = worker.send(dpi_ui::Cmd::Refresh)
+          }
+        }
+        _ => ()
+      }
+    }
+  })
   scope(world, fn(s : Scope) -> Unit {
     spawn(s, fn() -> Unit { ctx.run_loop(handle) })
-    // the watcher: the mouse opened (the DPI config.ini keeps put back), then each read the C side does handed over
+    if linux_tray_watch {
+      spawn(s, fn() -> Unit {
+        let ready = c_wait_tray_ready(1500) != 0
+        if !ready {
+          // Startup SNI registration failed or timed out: schedule window show on the GTK/GLib main loop.
+          c_notify_tray_show()
+        } else {
+          // Confirmed registered: stay watching and schedule window show on the GTK/GLib main loop if tray disappears.
+          if c_wait_tray_ready(-1) == 0 {
+            c_notify_tray_show()
+          }
+        }
+      })
+    }
+    // The watcher: initialize/restore saved DPI, emit initial atomic snapshot, then relay every revision update.
     spawn(s, fn() -> Unit {
-      let first = c_init_and_restore()
-      reads.emit(read_now(first))
-      let mut seen = c_state_rev()
+      let _ = c_init_and_restore()
+      let (ev0, rev0) = read_snapshot()
+      reads.emit(ev0)
+      let mut seen = rev0
       while seen >= 0 {
-        seen = c_wait_rev(seen)
-        if seen >= 0 {
-          reads.emit(read_now(c_connected()))
+        let next_rev = c_wait_rev(seen)
+        if next_rev < 0 {
+          seen = next_rev
+        } else {
+          let (ev, rev) = read_snapshot()
+          reads.emit(ev)
+          seen = rev
         }
       }
     })
     ui::run(
-      "PRO X2 SUPERSTRIKE",
+      "MouseDPI",
       fn(root : view::View) -> Unit {
-        dpi_ui::app(root, m, worker, window_act=fn(w : Int) -> Unit { hostapi::window_act(w) }, reads~, picture="mouse.png")
-        // shown once its first frame is drawn, unless it started in the tray (brought back from there by the host)
+        dpi_ui::app(
+          root,
+          m,
+          worker,
+          window_act=fn(w : Int) -> Unit { hostapi::window_act(w) },
+          reads~,
+          picture=picture,
+          show_window_controls=!is_macos,
+          macos_inset=is_macos,
+          close_label=close_label,
+          perm_hint=perm_hint,
+        )
+        if is_macos {
+          // Align macOS traffic lights vertically with the 44pt top bar (padding top 10 -> y=32).
+          // This build callback runs before the native host creates the first window slot, where
+          // window_buttons_down is a no-op; defer it once to the first frame, when the slot exists.
+          // Do NOT register set_window_close on macOS: let mac_app.m handle native hide/reopen & Shown.
+          let aligned : Array[Bool] = [false]
+          let _ = ui::on_before_frame(fn() {
+            if !aligned[0] {
+              aligned[0] = true
+              hostapi::window_buttons_down(10.0, 0.0)
+            }
+          })
+        }
+        // Shown once its first frame is drawn, unless started hidden in the tray.
         if !hidden {
           hostapi::window_show()
         }
