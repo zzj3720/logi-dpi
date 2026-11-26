@@ -123,6 +123,7 @@ uint64_t hidpp_plat_mouse_idle_ms(void);
 int32_t  hidpp_plat_started_hidden(void);
 int32_t  hidpp_plat_can_hide_to_tray(void);
 int32_t  hidpp_plat_wait_tray_ready(int32_t timeout_ms);
+void     hidpp_plat_notify_tray_show(void);
 int32_t  hidpp_plat_get_autostart(void);
 int32_t  hidpp_plat_set_autostart(int32_t enable);
 char    *hidpp_plat_picture_path_dup(void);
@@ -130,13 +131,14 @@ char    *hidpp_plat_picture_path_dup(void);
 int      hidpp_plat_config_read(int32_t *out_dpi, int32_t *out_lod);
 int      hidpp_plat_config_write(int32_t dpi, int32_t lod);
 
-/* ---- Public C ABI (28 exported symbols) ---- */
+/* ---- Public C ABI (31 exported symbols) ---- */
 int32_t mousedpi_started_hidden(void);
 int32_t mousedpi_peek_config(int32_t which);
 int32_t mousedpi_init_and_restore(void);
 void    mousedpi_request_refresh(void);
 void    mousedpi_request_set(int32_t dpi, int32_t lod);
 void    mousedpi_request_set_seq(int32_t seq, int32_t dpi, int32_t lod);
+void    mousedpi_request_set_target(int32_t seq, int32_t target_token, int32_t dpi, int32_t lod);
 int32_t mousedpi_state_rev(void);
 int32_t mousedpi_wait_rev(int32_t seen);
 void    mousedpi_stop_waits(void);
@@ -151,6 +153,7 @@ void    mousedpi_request_wake_restore(void);
 void    mousedpi_snapshot_capture(void);
 int32_t mousedpi_snap_rev(void);
 int32_t mousedpi_snap_applied_seq(void);
+int32_t mousedpi_snap_target_token(void);
 int32_t mousedpi_snap_connected(void);
 int32_t mousedpi_snap_dpi_x(void);
 int32_t mousedpi_snap_lod(void);
@@ -160,6 +163,7 @@ char   *mousedpi_snap_device_name_dup(void);
 char   *mousedpi_picture_path_dup(void);
 int32_t mousedpi_can_hide_to_tray(void);
 int32_t mousedpi_wait_tray_ready(int32_t timeout_ms);
+void    mousedpi_notify_tray_show(void);
 
 #ifdef __cplusplus
 }

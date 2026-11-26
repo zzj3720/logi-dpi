@@ -526,6 +526,21 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     return ready;
 }
 
+#ifndef HIDPP_CORE_TEST
+/* Invar host between-frame message delivery (post.h): runs on GLib main loop even while window is hidden. */
+extern void mb_post(const char *channel, const char *json, size_t len, const uint8_t *bytes, size_t blen)
+    __attribute__((weak));
+#endif
+
+void hidpp_plat_notify_tray_show(void) {
+#ifndef HIDPP_CORE_TEST
+    if (mb_post) {
+        static const char msg[] = "{\"show\":true}";
+        mb_post("mousedpi.tray", msg, sizeof(msg) - 1, NULL, 0);
+    }
+#endif
+}
+
 /* ---- Dynamic /sys/class/hidraw scan + HID_PHYS dedup + Report Descriptor check ---- */
 
 typedef struct linux_cand {

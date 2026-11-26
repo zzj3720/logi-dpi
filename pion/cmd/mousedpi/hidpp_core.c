@@ -383,6 +383,7 @@ int hidpp_posix_config_write_file(const char *path, int32_t dpi, int32_t lod) {
 typedef struct hidpp_state {
     int32_t rev;
     int32_t applied_seq;
+    int32_t target_token;
     int32_t connected;
     int32_t perm_denied;
     int32_t dpi_x;
@@ -412,12 +413,16 @@ static int            g_want_pending = 0;
 static int32_t        g_want_dpi = HIDPP_DEFAULT_DPI;
 static int32_t        g_want_lod = HIDPP_DEFAULT_LOD;
 static int32_t        g_want_seq = 0;
+static int32_t        g_want_target_token = 0;
+static int            g_want_has_token = 0;
 static char           g_want_target_ep[HIDPP_ENDPOINT_ID_MAX];
 static uint8_t        g_want_target_dev_idx = 0;
 
 /* Current connected target identity mirrored under g_snap_lock so user Set requests bind to it. */
 static char           g_live_target_ep[HIDPP_ENDPOINT_ID_MAX];
 static uint8_t        g_live_target_dev_idx = 0;
+static int32_t        g_next_target_token = 0;
+static int32_t        g_current_target_token = 0;
 
 static int            g_stopping = 0;
 static int            g_topology_dirty = 0;
@@ -876,6 +881,7 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
                     strcmp(g_last_connected_ep_id, eps[i].id) != 0 ||
                     g_last_connected_dev_idx != slots[s]) {
                     g_device_switched = 1;
+                    g_current_target_token = ++g_next_target_token;
                     memcpy(g_last_connected_ep_id, eps[i].id, sizeof(g_last_connected_ep_id));
                     g_last_connected_ep_id[sizeof(g_last_connected_ep_id) - 1] = '\0';
                     g_last_connected_dev_idx = slots[s];
@@ -1045,6 +1051,7 @@ static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
         }
         g_device_switched = 0;
         g_last_read_gen = g_endpoint_gen;
+        st.target_token = g_current_target_token;
         hidpp_mutex_lock(&g_snap_lock);
         memcpy(g_live_target_ep, g_cached_endpoint_id, sizeof(g_live_target_ep));
         g_live_target_ep[sizeof(g_live_target_ep) - 1] = '\0';
@@ -1064,13 +1071,21 @@ static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
 
 static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save_cfg,
                                      int bump_rev, int32_t min_applied_seq,
-                                     const char *want_ep, uint8_t want_dev_idx) {
+                                     const char *want_ep, uint8_t want_dev_idx,
+                                     int32_t want_token, int has_token) {
     if (x < HIDPP_MIN_DPI) x = HIDPP_MIN_DPI;
     if (x > HIDPP_MAX_DPI) x = HIDPP_MAX_DPI;
     if (y < HIDPP_MIN_DPI) y = HIDPP_MIN_DPI;
     if (y > HIDPP_MAX_DPI) y = HIDPP_MAX_DPI;
     if (lod < 1) lod = 1;
     if (lod > 3) lod = 3;
+
+    /* If UI passed an explicit target token (from Ev::Read) and it is empty/invalid or no longer matches
+     * the live device target (e.g. topology switched from A to B while sitting in Pion's worker queue),
+     * refuse to write onto the new device so refresher does a read-only refresh advancing applied_seq. */
+    if (has_token && want_token <= 0) {
+        return -5;
+    }
 
     hidpp_state_t st = load_live_state();
     int perm_denied = 0;
@@ -1086,8 +1101,11 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
         }
 
         uint8_t dev_idx = g_cached_dev_idx;
-        /* If this user write was bound to a specific device+slot, never apply it to a different mouse
-         * (e.g. after a topology change swapped from mouse A to mouse B while the request was queued). */
+        /* Verify both target token and physical (endpoint_id, dev_idx) before sending any write. */
+        if (has_token && g_current_target_token != want_token) {
+            hidpp_plat_close(dev);
+            return -5;
+        }
         if (want_ep && want_ep[0] != '\0' &&
             (strcmp(g_cached_endpoint_id, want_ep) != 0 || dev_idx != want_dev_idx)) {
             hidpp_plat_close(dev);
@@ -1102,7 +1120,7 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
         if (idx_dpi == 0) {
             hidpp_plat_close(dev);
             invalidate_cache_locked();
-            if (was_cached && (!want_ep || want_ep[0] == '\0')) continue;
+            if (was_cached && !has_token && (!want_ep || want_ep[0] == '\0')) continue;
             st.connected = 0;
             st.perm_denied = perm_denied ? 1 : 0;
             commit_state_seq(&st, bump_rev, min_applied_seq);
@@ -1142,10 +1160,9 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
         if (rc != HIDPP_XFER_OK) {
             hidpp_plat_close(dev);
             invalidate_cache_locked();
-            /* Only retry if the write report itself never left the host on a stale cached handle.
-             * Once fn=6 was written to the device (timeout/disconnect before ACK), never re-enumerate
-             * and replay onto a different mouse. */
-            if (was_cached && rc == HIDPP_XFER_ERR_WRITE && (!want_ep || want_ep[0] == '\0')) {
+            /* Only retry if the write report itself never left the host on a stale cached handle
+             * and no specific target binding was supplied. */
+            if (was_cached && rc == HIDPP_XFER_ERR_WRITE && !has_token && (!want_ep || want_ep[0] == '\0')) {
                 continue;
             }
             st.connected = 0;
@@ -1166,6 +1183,7 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
         st.dpi_x = rx;
         st.dpi_y = ry;
         st.lod = rlod;
+        st.target_token = g_current_target_token;
         hidpp_plat_close(dev);
 
         st.connected = 1;
@@ -1184,10 +1202,12 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
     return -3;
 }
 
+#ifdef HIDPP_CORE_TEST
 static int32_t set_dpi_locked(int32_t x, int32_t y, int32_t lod, int save_cfg,
                               int bump_rev, int32_t min_applied_seq) {
-    return set_dpi_locked_target(x, y, lod, save_cfg, bump_rev, min_applied_seq, NULL, 0);
+    return set_dpi_locked_target(x, y, lod, save_cfg, bump_rev, min_applied_seq, NULL, 0, 0, 0);
 }
+#endif
 
 static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
     if (out_changed) *out_changed = 0;
@@ -1425,11 +1445,14 @@ static void refresher_main(void *unused) {
         int32_t dpi = g_want_dpi;
         int32_t lod = g_want_lod;
         int32_t req_seq = g_want_seq;
+        int32_t req_token = g_want_target_token;
+        int req_has_token = g_want_has_token;
         char target_ep[HIDPP_ENDPOINT_ID_MAX];
         memcpy(target_ep, g_want_target_ep, sizeof(target_ep));
         target_ep[sizeof(target_ep) - 1] = '\0';
         uint8_t target_dev_idx = g_want_target_dev_idx;
         g_want_pending = 0;
+        g_want_has_token = 0;
         g_refresh_pending = 0;
         hidpp_mutex_unlock(&g_refresh_lock);
 
@@ -1438,7 +1461,8 @@ static void refresher_main(void *unused) {
         hidpp_mutex_lock(&g_hid_lock);
         consume_dirty_flags_locked();
         if (pending_set) {
-            if (set_dpi_locked_target(dpi, dpi, lod, 1, 1, req_seq, target_ep, target_dev_idx) != 0) {
+            if (set_dpi_locked_target(dpi, dpi, lod, 1, 1, req_seq,
+                                      target_ep, target_dev_idx, req_token, req_has_token) != 0) {
                 (void)read_state_locked(1, req_seq);
             }
         } else {
@@ -1558,6 +1582,11 @@ int32_t mousedpi_wait_tray_ready(int32_t timeout_ms) {
     return hidpp_plat_wait_tray_ready(timeout_ms);
 }
 
+void mousedpi_notify_tray_show(void) {
+    ensure_core_init();
+    hidpp_plat_notify_tray_show();
+}
+
 int32_t mousedpi_peek_config(int32_t which) {
     ensure_core_init();
     int32_t dpi = HIDPP_DEFAULT_DPI;
@@ -1588,7 +1617,15 @@ int32_t mousedpi_init_and_restore(void) {
         int y_mismatch = g_cached_has_indep_y && (st.dpi_y != cfg_dpi);
         int lod_mismatch = g_cached_has_lod && (st.lod != cfg_lod);
         if (ok && (st.dpi_x != cfg_dpi || y_mismatch || lod_mismatch)) {
-            if (set_dpi_locked(cfg_dpi, cfg_dpi, cfg_lod, 0, 0, 0) == 0) {
+            /* Bind startup restore strictly to the first device just read so a mid-restore
+             * disconnect can never spill onto a second mouse. */
+            char init_ep[HIDPP_ENDPOINT_ID_MAX];
+            memcpy(init_ep, g_cached_endpoint_id, sizeof(init_ep));
+            init_ep[sizeof(init_ep) - 1] = '\0';
+            uint8_t init_dev_idx = g_cached_dev_idx;
+            int32_t init_tok = g_current_target_token;
+            if (set_dpi_locked_target(cfg_dpi, cfg_dpi, cfg_lod, 0, 0, 0,
+                                      init_ep, init_dev_idx, init_tok, init_tok > 0 ? 1 : 0) == 0) {
                 hidpp_state_t confirmed = load_live_state();
                 g_saved_dpi = confirmed.dpi_x;
                 g_saved_lod = confirmed.lod;
@@ -1623,7 +1660,8 @@ void mousedpi_request_refresh(void) {
     hidpp_mutex_unlock(&g_refresh_lock);
 }
 
-static void request_set_internal(int32_t seq, int has_seq, int32_t dpi, int32_t lod) {
+static void request_set_internal(int32_t seq, int has_seq, int32_t target_token, int has_token,
+                                 int32_t dpi, int32_t lod) {
     ensure_core_init();
     start_watchers_once();
     char target_ep[HIDPP_ENDPOINT_ID_MAX];
@@ -1638,9 +1676,17 @@ static void request_set_internal(int32_t seq, int has_seq, int32_t dpi, int32_t 
     g_want_pending = 1;
     g_want_dpi = dpi;
     g_want_lod = lod;
-    memcpy(g_want_target_ep, target_ep, sizeof(g_want_target_ep));
-    g_want_target_ep[sizeof(g_want_target_ep) - 1] = '\0';
-    g_want_target_dev_idx = target_dev_idx;
+    g_want_target_token = target_token;
+    g_want_has_token = has_token;
+    if (has_token) {
+        /* Token carries the exact UI-seen target identity; don't re-sample C's live endpoint here. */
+        g_want_target_ep[0] = '\0';
+        g_want_target_dev_idx = 0;
+    } else {
+        memcpy(g_want_target_ep, target_ep, sizeof(g_want_target_ep));
+        g_want_target_ep[sizeof(g_want_target_ep) - 1] = '\0';
+        g_want_target_dev_idx = target_dev_idx;
+    }
     if (has_seq && seq > g_want_seq) {
         g_want_seq = seq;
     }
@@ -1649,11 +1695,15 @@ static void request_set_internal(int32_t seq, int has_seq, int32_t dpi, int32_t 
 }
 
 void mousedpi_request_set(int32_t dpi, int32_t lod) {
-    request_set_internal(0, 0, dpi, lod);
+    request_set_internal(0, 0, 0, 0, dpi, lod);
 }
 
 void mousedpi_request_set_seq(int32_t seq, int32_t dpi, int32_t lod) {
-    request_set_internal(seq, 1, dpi, lod);
+    request_set_internal(seq, 1, 0, 0, dpi, lod);
+}
+
+void mousedpi_request_set_target(int32_t seq, int32_t target_token, int32_t dpi, int32_t lod) {
+    request_set_internal(seq, 1, target_token, 1, dpi, lod);
 }
 
 void mousedpi_request_wake_restore(void) {
@@ -1799,6 +1849,14 @@ int32_t mousedpi_snap_applied_seq(void) {
     return v;
 }
 
+int32_t mousedpi_snap_target_token(void) {
+    ensure_core_init();
+    hidpp_mutex_lock(&g_snap_lock);
+    int32_t v = g_frozen_snap.target_token;
+    hidpp_mutex_unlock(&g_snap_lock);
+    return v;
+}
+
 int32_t mousedpi_snap_connected(void) {
     ensure_core_init();
     hidpp_mutex_lock(&g_snap_lock);
@@ -1878,6 +1936,8 @@ static void hidpp_core_test_reset(void) {
     init_default_state(&g_frozen_snap);
     g_live_target_ep[0] = '\0';
     g_live_target_dev_idx = 0;
+    g_next_target_token = 0;
+    g_current_target_token = 0;
     g_stopping = 0;
     g_topology_dirty = 0;
     g_feat_cache_dirty = 0;
@@ -1891,6 +1951,8 @@ static void hidpp_core_test_reset(void) {
     g_refresh_pending = 0;
     g_want_pending = 0;
     g_want_seq = 0;
+    g_want_target_token = 0;
+    g_want_has_token = 0;
     g_want_target_ep[0] = '\0';
     g_want_target_dev_idx = 0;
     hidpp_mutex_unlock(&g_refresh_lock);

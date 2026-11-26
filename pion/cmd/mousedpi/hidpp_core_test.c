@@ -212,6 +212,7 @@ uint64_t hidpp_plat_mouse_idle_ms(void) {
 int32_t hidpp_plat_started_hidden(void) { return 0; }
 int32_t hidpp_plat_can_hide_to_tray(void) { return 1; }
 int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) { (void)timeout_ms; return 1; }
+void    hidpp_plat_notify_tray_show(void) {}
 int32_t hidpp_plat_get_autostart(void) { return g_mock_autostart; }
 int32_t hidpp_plat_set_autostart(int32_t enable) {
     g_mock_autostart = enable ? 1 : 0;
@@ -1901,7 +1902,7 @@ static void test_single_target_write_no_spillover_to_second_mouse(void) {
 
     cfg_before = g_mock_cfg_writes;
     hidpp_mutex_lock(&g_hid_lock);
-    rc = set_dpi_locked_target(2400, 2400, 3, 1, 1, 10, "/dev/mouse_a2", 0x01);
+    rc = set_dpi_locked_target(2400, 2400, 3, 1, 1, 10, "/dev/mouse_a2", 0x01, 0, 0);
     hidpp_mutex_unlock(&g_hid_lock);
 
     assert(rc == -4);
@@ -1980,6 +1981,112 @@ static void test_single_target_write_no_spillover_to_second_mouse(void) {
     assert(b->dpi_x == 1200);
 
     mousedpi_stop_waits();
+
+    /* Case 4: UI captures token for A, C refreshes & publishes B (new token), THEN delayed worker
+     * submits Set with A's stale token -> B must receive 0 writes and seq must advance with B's state. */
+    mock_reset();
+    g_mock_dev_count = 2;
+    a = &g_mock_devs[0];
+    snprintf(a->id, sizeof(a->id), "/dev/mouse_a4");
+    a->vid = 0x046D;
+    a->pid = 0xC54D;
+    a->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    a->has_dpi_feature = 1;
+    a->active_slot = 0x01;
+    a->dpi_x = 800;
+    a->dpi_y = 800;
+    a->lod = 2;
+    a->caps_present = 1;
+    a->caps_num_levels = 5;
+    a->caps_flags = 0x03;
+
+    b = &g_mock_devs[1];
+    snprintf(b->id, sizeof(b->id), "/dev/mouse_b4");
+    b->vid = 0x046D;
+    b->pid = 0xC54D;
+    b->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    b->has_dpi_feature = 1;
+    b->active_slot = 0x01;
+    b->dpi_x = 1200;
+    b->dpi_y = 1200;
+    b->lod = 1;
+    b->caps_present = 1;
+    b->caps_num_levels = 5;
+    b->caps_flags = 0x03;
+
+    assert(mousedpi_init_and_restore() == 1);
+    mousedpi_snapshot_capture();
+    int32_t tok_a = mousedpi_snap_target_token();
+    assert(tok_a > 0);
+
+    /* Unplug A and let C publish B BEFORE the delayed Pion worker calls mousedpi_request_set_target */
+    hidpp_mutex_lock(&g_hid_lock);
+    g_has_saved = 0; /* Isolate user Set binding test from wake-restore of saved config */
+    hidpp_mutex_unlock(&g_hid_lock);
+    mock_lock();
+    a->has_dpi_feature = 0;
+    mock_unlock();
+    int32_t rev_sw0 = mousedpi_state_rev();
+    hidpp_core_signal_topology_change();
+    int32_t rev_sw1 = mousedpi_wait_rev(rev_sw0);
+    assert(rev_sw1 > rev_sw0);
+    mousedpi_snapshot_capture();
+    int32_t tok_b = mousedpi_snap_target_token();
+    assert(tok_b > tok_a);
+    assert(mousedpi_snap_dpi_x() == 1200);
+
+    /* Now delayed worker submits UI's Set bound to stale tok_a */
+    mousedpi_request_set_target(12, tok_a, 3000, 3);
+    int32_t rev_sw2 = mousedpi_wait_rev(rev_sw1);
+    assert(rev_sw2 > rev_sw1);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_applied_seq() == 12);
+    assert(mousedpi_snap_dpi_x() == 1200);
+    assert(b->fn6_writes == 0);
+    assert(b->dpi_x == 1200);
+    mousedpi_stop_waits();
+
+    /* Case 5: Startup restore bound to A; A eats fn=6 and drops before ACK while B is online -> B gets 0 writes */
+    mock_reset();
+    g_mock_cfg_has = 1;
+    g_mock_cfg_dpi = 2400;
+    g_mock_cfg_lod = 3;
+    g_mock_dev_count = 2;
+    a = &g_mock_devs[0];
+    snprintf(a->id, sizeof(a->id), "/dev/mouse_a5");
+    a->vid = 0x046D;
+    a->pid = 0xC54D;
+    a->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    a->has_dpi_feature = 1;
+    a->active_slot = 0x01;
+    a->dpi_x = 800;
+    a->dpi_y = 800;
+    a->lod = 2;
+    a->caps_present = 1;
+    a->caps_num_levels = 5;
+    a->caps_flags = 0x03;
+    a->fn6_drop_ack = 1;
+
+    b = &g_mock_devs[1];
+    snprintf(b->id, sizeof(b->id), "/dev/mouse_b5");
+    b->vid = 0x046D;
+    b->pid = 0xC54D;
+    b->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    b->has_dpi_feature = 1;
+    b->active_slot = 0x01;
+    b->dpi_x = 1200;
+    b->dpi_y = 1200;
+    b->lod = 1;
+    b->caps_present = 1;
+    b->caps_num_levels = 5;
+    b->caps_flags = 0x03;
+
+    assert(mousedpi_init_and_restore() == 1);
+    assert(a->fn6_writes == 1);
+    assert(b->fn6_writes == 0);
+    assert(b->dpi_x == 1200);
+    mousedpi_stop_waits();
+
     printf("[PASS] test_single_target_write_no_spillover_to_second_mouse\n");
 }
 

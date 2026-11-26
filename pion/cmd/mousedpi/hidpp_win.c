@@ -112,6 +112,9 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     return 1;
 }
 
+void hidpp_plat_notify_tray_show(void) {
+}
+
 static int parse_hex4_after(const char *hay, const char *prefix, uint16_t *out) {
     size_t plen = strlen(prefix);
     for (const char *p = hay; *p; p++) {
@@ -511,10 +514,10 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
             if (w == WAIT_OBJECT_0) {
                 ok = GetOverlappedResult(target, &ov, &written, FALSE);
             } else {
-                /* Must wait for kernel I/O completion before releasing stack OVERLAPPED & event. */
+                /* Wait for final kernel completion and honor it if the write actually finished
+                 * before CancelIoEx took effect (prevents replaying a landed write on another mouse). */
                 CancelIoEx(target, &ov);
-                (void)GetOverlappedResult(target, &ov, &written, TRUE);
-                ok = FALSE;
+                ok = GetOverlappedResult(target, &ov, &written, TRUE);
             }
         }
     }

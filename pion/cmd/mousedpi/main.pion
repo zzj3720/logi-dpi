@@ -25,6 +25,8 @@ extern "C" fn c_request_set(dpi : Int, lod : Int) -> Unit = "mousedpi_request_se
 
 extern "C" fn c_request_set_seq(seq : Int, dpi : Int, lod : Int) -> Unit = "mousedpi_request_set_seq"
 
+extern "C" fn c_request_set_target(seq : Int, target_token : Int, dpi : Int, lod : Int) -> Unit = "mousedpi_request_set_target"
+
 extern "C" fn c_request_wake_restore() -> Unit = "mousedpi_request_wake_restore"
 
 extern "C" fn c_state_rev() -> Int = "mousedpi_state_rev"
@@ -38,6 +40,8 @@ extern "C" fn c_snapshot_capture() -> Unit = "mousedpi_snapshot_capture"
 extern "C" fn c_snap_rev() -> Int = "mousedpi_snap_rev"
 
 extern "C" fn c_snap_applied_seq() -> Int = "mousedpi_snap_applied_seq"
+
+extern "C" fn c_snap_target_token() -> Int = "mousedpi_snap_target_token"
 
 extern "C" fn c_snap_connected() -> Int = "mousedpi_snap_connected"
 
@@ -56,6 +60,8 @@ extern "C" fn c_picture_path_dup() -> Ptr = "mousedpi_picture_path_dup"
 extern "C" fn c_can_hide_to_tray() -> Int = "mousedpi_can_hide_to_tray"
 
 extern "C" fn c_wait_tray_ready(timeout_ms : Int) -> Int = "mousedpi_wait_tray_ready"
+
+extern "C" fn c_notify_tray_show() -> Unit = "mousedpi_notify_tray_show"
 
 extern "C" fn c_autostart() -> Int = "mousedpi_get_autostart"
 
@@ -82,6 +88,7 @@ fn read_snapshot() -> (dpi_ui::Ev, Int) {
     c_snap_perm_denied() != 0,
     take_c_str(c_snap_device_name_dup()),
     c_snap_applied_seq(),
+    c_snap_target_token(),
   )
   (ev, c_snap_rev())
 }
@@ -91,7 +98,7 @@ fn handle(cmd : dpi_ui::Cmd, emit : (dpi_ui::Ev) -> Unit) -> Unit {
   match cmd {
     dpi_ui::Cmd::Refresh => c_request_refresh()
     dpi_ui::Cmd::WakeRestore => c_request_wake_restore()
-    dpi_ui::Cmd::Set(seq, dpi, lod) => c_request_set_seq(seq, dpi, lod)
+    dpi_ui::Cmd::Set(seq, target_token, dpi, lod) => c_request_set_target(seq, target_token, dpi, lod)
     dpi_ui::Cmd::Autostart(on) => emit(dpi_ui::Ev::Autostarts(c_set_autostart(if on { 1 } else { 0 }) != 0))
   }
 }
@@ -143,7 +150,11 @@ fn main(world : World) -> Int {
   m.autostart.set(c_autostart() != 0)
   let (worker, ctx) : (ui::Worker[dpi_ui::Cmd, dpi_ui::Ev], ui::WorkerCtx[dpi_ui::Cmd, dpi_ui::Ev]) = ui::Worker::pair()
   let reads : ui::EventQueue[dpi_ui::Ev] = ui::EventQueue::new()
-  let tray_decisions : ui::EventQueue[Bool] = ui::EventQueue::new()
+  // Between-frame message channel for revealing a startup-hidden Linux window when SNI registration fails
+  // or the tray watcher disappears: delivered on the GLib main loop even while no window frame ticks.
+  ui::on_message("mousedpi.tray", fn(_json : String, _bytes : Option[Bytes]) -> Unit {
+    hostapi::window_show()
+  })
   // Register system lifecycle listener before ui::run so Shown/wake events are never missed.
   ui::on_message(hostapi::system_channel, fn(json : String, _bytes : Option[Bytes]) -> Unit {
     for said in hostapi::system_said(json) {
@@ -167,12 +178,12 @@ fn main(world : World) -> Int {
       spawn(s, fn() -> Unit {
         let ready = c_wait_tray_ready(1500) != 0
         if !ready {
-          // Startup SNI registration failed or timed out: reveal the hidden window.
-          tray_decisions.emit(false)
+          // Startup SNI registration failed or timed out: reveal the hidden window via between-frame post.
+          c_notify_tray_show()
         } else {
-          // Confirmed registered: stay watching and reveal only if the tray definitely disappears.
+          // Confirmed registered: stay watching and reveal via between-frame post if tray definitely disappears.
           if c_wait_tray_ready(-1) == 0 {
-            tray_decisions.emit(false)
+            c_notify_tray_show()
           }
         }
       })
@@ -223,15 +234,7 @@ fn main(world : World) -> Int {
           })
         }
         // Shown once its first frame is drawn, unless started hidden in the tray.
-        if linux_tray_watch {
-          let _ = ui::on_before_frame(fn() {
-            let _ = tray_decisions.drain(fn(ready : Bool) -> Unit {
-              if !ready {
-                hostapi::window_show()
-              }
-            })
-          })
-        } else if !hidden {
+        if !hidden {
           hostapi::window_show()
         }
       },

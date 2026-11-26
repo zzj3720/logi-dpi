@@ -675,6 +675,9 @@ int32_t hidpp_plat_wait_tray_ready(int32_t timeout_ms) {
     return 1;
 }
 
+void hidpp_plat_notify_tray_show(void) {
+}
+
 int hidpp_plat_config_read(int32_t *out_dpi, int32_t *out_lod) {
     init_paths();
     return hidpp_posix_config_read_file(g_cfg_path, out_dpi, out_lod);

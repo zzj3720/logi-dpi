@@ -51,10 +51,12 @@ fn ink_tertiary() -> Int64 {
   lg::surface().ink_tertiary
 }
 
-/// The worker's events into `m` (bound before every frame; `pending_seq[0]` is the latest requested write sequence).
-fn take(m : Mouse, pending_seq : Array[Int], ev : Ev) -> Unit {
+/// The worker's events into `m` (bound before every frame; `pending_seq[0]` is the latest requested write sequence,
+/// and `active_token[0]` is the atomic device target token carried by the latest snapshot).
+fn take(m : Mouse, pending_seq : Array[Int], active_token : Array[Int], ev : Ev) -> Unit {
   match ev {
-    Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq) => {
+    Ev::Read(ok, dpi, lod, battery, perm_denied, device_name, applied_seq, target_token) => {
+      active_token[0] = target_token
       m.connected.set(ok)
       m.perm_denied.set(perm_denied)
       if device_name != "" {
@@ -269,22 +271,23 @@ pub fn app(
   perm_hint~ : String = "请安装 udev 规则或在系统设置中授予权限",
 ) -> Unit {
   let pending_seq : Array[Int] = [0]
-  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, ev) })
+  let active_token : Array[Int] = [0]
+  worker.bind(fn(ev : Ev) -> Unit { take(m, pending_seq, active_token, ev) })
   // reads the device side does on its own (a thread that waits on them), taken as the worker's are
   match reads {
     Some(q) => {
-      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, ev) }) })
+      let _ = ui::on_before_frame(fn() { let _ = q.drain(fn(ev : Ev) -> Unit { take(m, pending_seq, active_token, ev) }) })
     }
     None => ()
   }
-  // shown at once; written by the worker with a monotonic sequence number so stale reads are ignored
-  // while the real device readback (including rejections or clamping) is applied immediately.
+  // shown at once; written by the worker with a monotonic sequence number and the UI-seen device target token
+  // so stale reads are ignored, cross-device spillover is impossible, and real readbacks apply immediately.
   let ask = fn(dpi : Int, lod : Int) -> Unit {
     let seq = pending_seq[0] + 1
     pending_seq[0] = seq
     m.dpi.set(dpi)
     m.lod.set(lod)
-    let _ = worker.send(Cmd::Set(seq, dpi, lod))
+    let _ = worker.send(Cmd::Set(seq, active_token[0], dpi, lod))
   }
   <lg::PageShell
     in={root}
