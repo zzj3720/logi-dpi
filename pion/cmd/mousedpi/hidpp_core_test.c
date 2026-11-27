@@ -60,6 +60,7 @@ typedef struct mock_device {
     int                   reject_nonzero_y_lod;
     int                   fn6_writes;
     int                   noise_forever;
+    int                   asleep_drops;    /* replies to this many HID++ 2.0 requests never come (mouse asleep) */
     int                   notif_reg_writes;
     uint8_t               reg00_init[3];   /* initial register 0x00 reply bytes [4..6] */
     int                   reg00_readable;
@@ -352,6 +353,12 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
     uint8_t feat_idx = buf[2];
     uint8_t fn_sw    = buf[3];
     uint8_t fn       = (uint8_t)(fn_sw >> 4);
+
+    if (m->asleep_drops > 0) {
+        m->asleep_drops--;
+        mock_unlock();
+        return (int)len;
+    }
 
     if (m->noise_forever) {
         /* Never enqueue a matching response */
@@ -669,7 +676,8 @@ static void test_fast_fail_10_8f_and_ff_and_single_deadline(void) {
     assert(dt < 150);
     mousedpi_stop_waits();
 
-    /* Single monotonic deadline ~350ms under continuous unrelated noise (NOT 8 * 350ms) */
+    /* One deadline per transfer under continuous unrelated noise: the first getFeature is asked
+     * HIDPP_WAKE_PROBE_TRIES times (a sleeping mouse answers after ~1 s), never more. */
     mock_reset();
     g_mock_dev_count = 1;
     m = &g_mock_devs[0];
@@ -683,9 +691,35 @@ static void test_fast_fail_10_8f_and_ff_and_single_deadline(void) {
     ok = mousedpi_init_and_restore();
     dt = hidpp_plat_now_ms() - t0;
     assert(ok == 0);
-    assert(dt >= 300 && dt < 900);
+    assert(dt >= 300 * HIDPP_WAKE_PROBE_TRIES && dt < 350 * HIDPP_WAKE_PROBE_TRIES + 550);
     mousedpi_stop_waits();
     printf("[PASS] test_fast_fail_10_8f_and_ff_and_single_deadline\n");
+}
+
+static void test_asleep_mouse_answers_late(void) {
+    /* A sleeping mouse: the replies to its first requests never come within one transfer's timeout. */
+    mock_reset();
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/mock_asleep");
+    m->vid = 0x046D;
+    m->pid = 0xC54D;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1600;
+    m->dpi_y = 1600;
+    m->lod = 2;
+    m->battery = 70;
+    m->asleep_drops = HIDPP_WAKE_PROBE_TRIES - 1;
+
+    int32_t ok = mousedpi_init_and_restore();
+    assert(ok == 1);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_dpi_x() == 1600);
+    mousedpi_stop_waits();
+    printf("[PASS] test_asleep_mouse_answers_late\n");
 }
 
 static void test_truncated_dpi_resp_rejected(void) {
@@ -2099,6 +2133,7 @@ int main(void) {
     test_pid_classification();
     test_strict_frame_matching_and_drain();
     test_fast_fail_10_8f_and_ff_and_single_deadline();
+    test_asleep_mouse_answers_late();
     test_truncated_dpi_resp_rejected();
     test_multi_candidate_probe_and_perm_denied();
     test_direct_wired_no_receiver_notif_and_wake_restore();

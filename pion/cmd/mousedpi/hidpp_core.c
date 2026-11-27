@@ -691,11 +691,22 @@ static int hidpp_xfer(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t feat_idx, uint8
     }
 }
 
+#ifndef HIDPP_WAKE_PROBE_TRIES
+#define HIDPP_WAKE_PROBE_TRIES 4
+#endif
+
+/* A sleeping wireless mouse answers its first request only after ~1 s (the receiver holds it until
+ * the mouse wakes), past one transfer's timeout: on a timeout the same question is asked again, which
+ * is safe since a late answer to the earlier copy carries the same answer. */
 static uint8_t get_feature_idx(hidpp_dev_t *dev, uint8_t dev_idx, uint16_t fid) {
     uint8_t p[2] = { (uint8_t)(fid >> 8), (uint8_t)(fid & 0xFFu) };
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
-    if (hidpp_xfer(dev, dev_idx, 0x00u, 0x00u, p, 2, r, &got) != HIDPP_XFER_OK) {
+    int rc = HIDPP_XFER_ERR_TIMEOUT;
+    for (int attempt = 0; attempt < HIDPP_WAKE_PROBE_TRIES && rc == HIDPP_XFER_ERR_TIMEOUT; attempt++) {
+        rc = hidpp_xfer(dev, dev_idx, 0x00u, 0x00u, p, 2, r, &got);
+    }
+    if (rc != HIDPP_XFER_OK) {
         return 0;
     }
     return r[4];
