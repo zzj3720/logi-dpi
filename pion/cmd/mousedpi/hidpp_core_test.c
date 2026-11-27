@@ -71,6 +71,8 @@ typedef struct mock_device {
     int                   caps_timeout;
     int                   disconnect_after_fn6;
     int                   fn6_drop_ack;
+    int                   adj_dpi_only;    /* 1: has 0x2201 Adjustable DPI at idx 0x05 instead of 0x2202 */
+    int                   adj_fn3_writes;
 
     /* Pre-queued stale frames to test drain */
     mock_frame_t          stale[8];
@@ -402,11 +404,41 @@ int hidpp_plat_write(hidpp_dev_t *dev, const uint8_t *buf, size_t len) {
     if (feat_idx == 0x00 && fn == 0) {
         /* IRoot getFeature */
         uint16_t fid = (uint16_t)(((uint16_t)buf[4] << 8) | buf[5]);
-        if (fid == 0x2202) r[4] = 0x05;
+        if (fid == 0x2202) r[4] = m->adj_dpi_only ? 0x00 : 0x05;
+        else if (fid == 0x2201) r[4] = m->adj_dpi_only ? 0x05 : 0x00;
         else if (fid == 0x1004) r[4] = m->no_battery ? 0x00 : 0x06;
         else if (fid == 0x8100) r[4] = m->no_onboard ? 0x00 : 0x07;
         else if (fid == 0x0005) r[4] = 0x08;
         else r[4] = 0x00;
+        dev_push_rx(dev, r, 20);
+    } else if (feat_idx == 0x00 && fn == 1) {
+        /* IRoot getProtocolVersion (ping): HID++ 4.2, echoes the ping byte */
+        r[4] = 0x04;
+        r[5] = 0x02;
+        r[6] = buf[6];
+        dev_push_rx(dev, r, 20);
+    } else if (feat_idx == 0x05 && m->adj_dpi_only) {
+        /* 0x2201 Adjustable DPI: fn=2 getSensorDpi(sensor), fn=3 setSensorDpi(sensor, dpi) */
+        if (fn == 2 && buf[4] == 0x00) {
+            r[4] = 0x00;
+            r[5] = (uint8_t)((m->dpi_x >> 8) & 0xFF);
+            r[6] = (uint8_t)(m->dpi_x & 0xFF);
+            r[7] = 0x03;
+            r[8] = 0x20; /* default 800 */
+        } else if (fn == 3 && buf[4] == 0x00) {
+            m->adj_fn3_writes++;
+            m->dpi_x = ((int32_t)buf[5] << 8) | buf[6];
+            m->dpi_y = m->dpi_x;
+            r[4] = 0x00;
+            r[5] = buf[5];
+            r[6] = buf[6];
+        } else {
+            /* 0x2201 has no fn=5/6 (those are 0x2202's): INVALID_FUNCTION_ID */
+            r[2] = 0xFF;
+            r[3] = feat_idx;
+            r[4] = fn_sw;
+            r[5] = 0x07;
+        }
         dev_push_rx(dev, r, 20);
     } else if (feat_idx == 0x05 && fn == 1) {
         /* 0x2202 getSensorCapabilities: r[4]=sensorIdx, r[5]=numDpiLevels, r[6]=capabilities */
@@ -2095,6 +2127,56 @@ static void test_single_target_write_no_spillover_to_second_mouse(void) {
     printf("[PASS] test_single_target_write_no_spillover_to_second_mouse\n");
 }
 
+static void test_adjustable_dpi_0x2201_fallback(void) {
+    /* A PRO X SUPERLIGHT (LIGHTSPEED receiver c547) has 0x2201 Adjustable DPI and no 0x2202. */
+    mock_reset();
+    g_mock_dev_count = 1;
+    mock_device_t *m = &g_mock_devs[0];
+    snprintf(m->id, sizeof(m->id), "/dev/mock_superlight");
+    m->vid = 0x046D;
+    m->pid = 0xC547;
+    m->kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
+    m->has_dpi_feature = 1;
+    m->adj_dpi_only = 1;
+    m->active_slot = 0x01;
+    m->dpi_x = 1500;
+    m->dpi_y = 1500;
+    m->lod = 2;
+    m->battery = 80;
+    snprintf(m->dev_name, sizeof(m->dev_name), "PRO X SUPERLIGHT");
+
+    int32_t ok = mousedpi_init_and_restore();
+    assert(ok == 1);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_perm_denied() == 0);
+    assert(mousedpi_snap_dpi_x() == 1500);
+    assert(mousedpi_snap_battery() == 80);
+    char *name = mousedpi_snap_device_name_dup();
+    assert(name != NULL && strcmp(name, "PRO X SUPERLIGHT") == 0);
+    free(name);
+    assert(g_cached_dpi_feat == HIDPP_FEAT_ADJ_DPI);
+    assert(g_cached_has_lod == 0 && g_cached_has_indep_y == 0);
+
+    /* A set goes out as 0x2201 fn=3 (never 0x2202 fn=6), is read back with fn=2, and LOD stays as it was. */
+    int32_t rev0 = mousedpi_state_rev();
+    mousedpi_request_set_seq(5, 2400, 3);
+    int32_t rev1 = mousedpi_wait_rev(rev0);
+    assert(rev1 > rev0);
+    mousedpi_snapshot_capture();
+    assert(mousedpi_snap_connected() == 1);
+    assert(mousedpi_snap_applied_seq() == 5);
+    assert(mousedpi_snap_dpi_x() == 2400);
+    assert(mousedpi_snap_lod() == 2);
+    assert(m->dpi_x == 2400);
+    assert(m->adj_fn3_writes == 1);
+    assert(m->fn6_writes == 0);
+    assert(g_mock_cfg_dpi == 2400);
+    mousedpi_stop_waits();
+    printf("[PASS] test_adjustable_dpi_0x2201_fallback\n");
+
+}
+
 int main(void) {
     test_pid_classification();
     test_strict_frame_matching_and_drain();
@@ -2120,6 +2202,7 @@ int main(void) {
     test_concurrent_stop_waits_single_ownership();
     test_notify_first_open_from_empty_and_no_unrelated_flicker();
     test_single_target_write_no_spillover_to_second_mouse();
+    test_adjustable_dpi_0x2201_fallback();
     printf("ALL HID++ CORE TESTS PASSED!\n");
     return 0;
 }

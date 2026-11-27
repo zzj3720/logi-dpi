@@ -452,6 +452,7 @@ static char                  g_cached_endpoint_id[HIDPP_ENDPOINT_ID_MAX];
 static hidpp_endpoint_kind_t g_cached_kind = HIDPP_KIND_LIGHTSPEED_RECEIVER;
 static uint8_t               g_cached_dev_idx = 0x01;
 static uint8_t               g_cached_idx_dpi = 0;
+static uint16_t              g_cached_dpi_feat = HIDPP_FEAT_EXT_DPI; /* 0x2202, or 0x2201 on older mice */
 static uint8_t               g_cached_idx_ob = 0;
 static uint8_t               g_cached_idx_bat = 0;
 static uint8_t               g_cached_idx_name = 0;
@@ -567,6 +568,7 @@ static hidpp_state_t load_live_state(void) {
 
 static void invalidate_feature_cache_locked(void) {
     g_cached_idx_dpi = 0;
+    g_cached_dpi_feat = HIDPP_FEAT_EXT_DPI;
     g_cached_idx_ob = 0;
     g_cached_idx_bat = 0;
     g_cached_idx_name = 0;
@@ -699,6 +701,47 @@ static uint8_t get_feature_idx(hidpp_dev_t *dev, uint8_t dev_idx, uint16_t fid) 
         return 0;
     }
     return r[4];
+}
+
+/* Index of the DPI feature: 0x2202 (Extended Adjustable DPI) first, else 0x2201 (Adjustable DPI),
+ * which mice such as the PRO X Wireless / PRO X SUPERLIGHT have instead. 0x2201 is asked only after
+ * an IRoot ping (fn=1) answers: the device is awake and any late reply to the 0x2202 query (fn=0,
+ * which a ping's reply cannot be taken for) has come before it, so it is never read as 0x2201's. */
+static uint8_t find_dpi_feature(hidpp_dev_t *dev, uint8_t dev_idx, uint16_t *out_fid) {
+    uint8_t idx = get_feature_idx(dev, dev_idx, HIDPP_FEAT_EXT_DPI);
+    if (idx != 0) {
+        *out_fid = HIDPP_FEAT_EXT_DPI;
+        return idx;
+    }
+    uint8_t ping[3] = { 0x00u, 0x00u, 0x5Au };
+    uint8_t r[HIDPP_LONG_LEN];
+    int got = 0;
+    if (hidpp_xfer(dev, dev_idx, 0x00u, 0x01u, ping, 3, r, &got) != HIDPP_XFER_OK || r[6] != 0x5Au) {
+        return 0;
+    }
+    idx = get_feature_idx(dev, dev_idx, HIDPP_FEAT_ADJ_DPI);
+    if (idx != 0) *out_fid = HIDPP_FEAT_ADJ_DPI;
+    return idx;
+}
+
+/* Writes DPI (and, on 0x2202, Y and LOD) with the cached DPI feature's set function:
+ * 0x2202 fn=6 setSensorDpi(sensor, x, y, lod), 0x2201 fn=3 setSensorDpi(sensor, dpi). */
+static int write_sensor_dpi_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_dpi,
+                                   int32_t x, int32_t y_send, int32_t lod_send,
+                                   uint8_t r[HIDPP_LONG_LEN], int *out_got) {
+    if (g_cached_dpi_feat == HIDPP_FEAT_ADJ_DPI) {
+        uint8_t pa[3] = { 0x00u, (uint8_t)((x >> 8) & 0xFF), (uint8_t)(x & 0xFF) };
+        return hidpp_xfer(dev, dev_idx, idx_dpi, 3, pa, 3, r, out_got);
+    }
+    uint8_t pd[6] = {
+        0x00u,
+        (uint8_t)((x >> 8) & 0xFF),
+        (uint8_t)(x & 0xFF),
+        (uint8_t)((y_send >> 8) & 0xFF),
+        (uint8_t)(y_send & 0xFF),
+        (uint8_t)lod_send
+    };
+    return hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, out_got);
 }
 
 /* Strict HID++ 1.0 register 0x00 read-modify-write to enable wireless notifications
@@ -866,7 +909,8 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
         }
 
         for (int s = 0; s < nslots; s++) {
-            uint8_t idx_dpi = get_feature_idx(dev, slots[s], HIDPP_FEAT_EXT_DPI);
+            uint16_t dpi_feat = HIDPP_FEAT_EXT_DPI;
+            uint8_t idx_dpi = find_dpi_feature(dev, slots[s], &dpi_feat);
             if (idx_dpi != 0) {
                 g_endpoint_gen++;
                 g_cache_valid = 1;
@@ -876,6 +920,7 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
                 g_cached_dev_idx = slots[s];
                 invalidate_feature_cache_locked();
                 g_cached_idx_dpi = idx_dpi;
+                g_cached_dpi_feat = dpi_feat;
 
                 if (g_last_connected_ep_id[0] == '\0' ||
                     strcmp(g_last_connected_ep_id, eps[i].id) != 0 ||
@@ -908,6 +953,16 @@ static hidpp_dev_t *open_active_endpoint_locked(int *out_perm_denied) {
 static void ensure_dpi_caps_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx_dpi) {
     if (g_cached_caps_read) return;
 
+    if (g_cached_dpi_feat == HIDPP_FEAT_ADJ_DPI) {
+        /* 0x2201 sets one DPI for both axes and has no lift-off distance. */
+        g_cached_has_indep_y    = 0;
+        g_cached_has_lod        = 0;
+        g_cached_caps_confirmed = 1;
+        g_cached_caps_read      = 1;
+        g_cached_caps_fails     = 0;
+        return;
+    }
+
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
     uint8_t p0[1] = { 0x00u };
@@ -939,6 +994,25 @@ static int read_sensor_dpi_locked(hidpp_dev_t *dev, uint8_t dev_idx, uint8_t idx
     uint8_t r[HIDPP_LONG_LEN];
     int got = 0;
     uint8_t p0[1] = { 0x00u };
+    if (g_cached_dpi_feat == HIDPP_FEAT_ADJ_DPI) {
+        /* 0x2201 fn=2 getSensorDpi: [.., sensorIdx(r[4]), dpi(r[5..6]), defaultDpi(r[7..8])] */
+        if (hidpp_xfer(dev, dev_idx, idx_dpi, 2, p0, 1, r, &got) != HIDPP_XFER_OK || got < 9) {
+            return 0;
+        }
+        int32_t d = ((int32_t)r[5] << 8) | r[6];
+        if (d == 0) {
+            d = ((int32_t)r[7] << 8) | r[8];
+        }
+        if (d < HIDPP_MIN_DPI || d > HIDPP_MAX_DPI) {
+            return 0;
+        }
+        g_cached_fn5_saw_lod = 0;
+        g_cached_has_lod = 0;
+        if (out_x) *out_x = d;
+        if (out_y) *out_y = d;
+        if (out_lod) *out_lod = fallback_lod;
+        return 1;
+    }
     if (hidpp_xfer(dev, dev_idx, idx_dpi, 5, p0, 1, r, &got) != HIDPP_XFER_OK || got < 14) {
         return 0;
     }
@@ -982,8 +1056,10 @@ static int32_t read_state_locked(int bump_rev, int32_t min_applied_seq) {
         uint8_t dev_idx = g_cached_dev_idx;
         uint8_t idx_dpi = g_cached_idx_dpi;
         if (idx_dpi == 0) {
-            idx_dpi = get_feature_idx(dev, dev_idx, HIDPP_FEAT_EXT_DPI);
+            uint16_t dpi_feat = HIDPP_FEAT_EXT_DPI;
+            idx_dpi = find_dpi_feature(dev, dev_idx, &dpi_feat);
             g_cached_idx_dpi = idx_dpi;
+            g_cached_dpi_feat = dpi_feat;
         }
         if (idx_dpi == 0) {
             hidpp_plat_close(dev);
@@ -1114,8 +1190,10 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
 
         uint8_t idx_dpi = g_cached_idx_dpi;
         if (idx_dpi == 0) {
-            idx_dpi = get_feature_idx(dev, dev_idx, HIDPP_FEAT_EXT_DPI);
+            uint16_t dpi_feat = HIDPP_FEAT_EXT_DPI;
+            idx_dpi = find_dpi_feature(dev, dev_idx, &dpi_feat);
             g_cached_idx_dpi = idx_dpi;
+            g_cached_dpi_feat = dpi_feat;
         }
         if (idx_dpi == 0) {
             hidpp_plat_close(dev);
@@ -1143,15 +1221,7 @@ static int32_t set_dpi_locked_target(int32_t x, int32_t y, int32_t lod, int save
 
         int32_t y_send = g_cached_has_indep_y ? y : 0;
         int32_t lod_send = g_cached_has_lod ? lod : 0;
-        uint8_t pd[6] = {
-            0x00u,
-            (uint8_t)((x >> 8) & 0xFF),
-            (uint8_t)(x & 0xFF),
-            (uint8_t)((y_send >> 8) & 0xFF),
-            (uint8_t)(y_send & 0xFF),
-            (uint8_t)lod_send
-        };
-        int rc = hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got);
+        int rc = write_sensor_dpi_locked(dev, dev_idx, idx_dpi, x, y_send, lod_send, r, &got);
 
         if (rc == HIDPP_XFER_ERR_HIDPP2) {
             hidpp_plat_close(dev);
@@ -1228,8 +1298,10 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
     uint8_t dev_idx = g_cached_dev_idx;
     uint8_t idx_dpi = g_cached_idx_dpi;
     if (idx_dpi == 0) {
-        idx_dpi = get_feature_idx(dev, dev_idx, HIDPP_FEAT_EXT_DPI);
+        uint16_t dpi_feat = HIDPP_FEAT_EXT_DPI;
+        idx_dpi = find_dpi_feature(dev, dev_idx, &dpi_feat);
         g_cached_idx_dpi = idx_dpi;
+        g_cached_dpi_feat = dpi_feat;
     }
     if (idx_dpi == 0) {
         hidpp_plat_close(dev);
@@ -1281,15 +1353,7 @@ static int ensure_dpi_fast_locked(int force_write, int *out_changed) {
         int32_t x = g_saved_dpi;
         int32_t y_send = g_cached_has_indep_y ? x : 0;
         int32_t lod_send = g_cached_has_lod ? g_saved_lod : 0;
-        uint8_t pd[6] = {
-            0x00u,
-            (uint8_t)((x >> 8) & 0xFF),
-            (uint8_t)(x & 0xFF),
-            (uint8_t)((y_send >> 8) & 0xFF),
-            (uint8_t)(y_send & 0xFF),
-            (uint8_t)lod_send
-        };
-        if (hidpp_xfer(dev, dev_idx, idx_dpi, 6, pd, 6, r, &got) == HIDPP_XFER_OK) {
+        if (write_sensor_dpi_locked(dev, dev_idx, idx_dpi, x, y_send, lod_send, r, &got) == HIDPP_XFER_OK) {
             /* Always confirm actual applied DPI/LOD from sensor via fn=5 readback. */
             int32_t rx = 0, ry = 0, rlod = st.lod;
             if (!read_sensor_dpi_locked(dev, dev_idx, idx_dpi, &rx, &ry, &rlod, st.lod)) {
