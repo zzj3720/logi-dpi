@@ -23,6 +23,7 @@ extern "C" {
 #define HIDPP_FEAT_IROOT          0x0000u
 #define HIDPP_FEAT_DEV_NAME       0x0005u
 #define HIDPP_FEAT_BATTERY        0x1004u
+#define HIDPP_FEAT_ADJ_DPI        0x2201u /* older mice (e.g. PRO X Wireless): one DPI, no Y/LOD */
 #define HIDPP_FEAT_EXT_DPI        0x2202u
 #define HIDPP_FEAT_ONBOARD        0x8100u
 
